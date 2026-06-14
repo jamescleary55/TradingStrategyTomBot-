@@ -1,0 +1,32 @@
+# Personal trading rules for ict-futures-bot.
+# Copy to ~/.ict-bot/personal_rules.yaml and edit. The bot reads the user
+# copy first; this file is a template under git.
+
+# --- Universe --------------------------------------------------------
+allowed_symbols: [MNQ, MES, MCL]    # micros only by default for paper safety
+allowed_sessions: [LONDON, NY_AM]   # killzones
+
+# --- Sizing ----------------------------------------------------------
+risk_per_trade_R: 0.25              # 0.25R per trade on paper (very conservative)
+min_expected_R: 1.5                 # reject setups with RR below this
+min_setup_score: 0.55               # 0..1, strategy-specific
+
+# --- Daily / weekly caps --------------------------------------------
+max_daily_loss_R: 1.0               # halt for the day after losing this much
+max_weekly_loss_R: 3.0
+max_trades_per_day: 3
+max_trades_per_symbol_per_day: 2
+max_open_positions: 1
+max_consecutive_losses: 2           # halt after N losses in a row
+
+# --- Filters ---------------------------------------------------------
+news_blackout_minutes: 30           # ± minutes around NFP/CPI/FOMC
+news_filter_enabled: true
+
+# --- Execution -------------------------------------------------------
+enable_auto_execute: false          # MUST be explicit to flip to true
+broker: tradovate                   # tradovate | topstepx | dryrun
+mode: review                        # review | paper | live (live requires TRADOVATE_ENV != demo)
+
+# --- Kill switch -----------------------------------------------------
+kill_switch_path: ~/.ict-bot/KILL_SWITCH

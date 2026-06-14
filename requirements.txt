@@ -1,0 +1,16 @@
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+websocket-client>=1.6
+python-dotenv>=1.0
+backtrader>=1.9.78
+matplotlib>=3.7
+pytz>=2023.3
+rich>=13.7
+yfinance>=0.2.40
+flask>=3.0
+pyyaml>=6.0
+pytest>=7.4
+beautifulsoup4>=4.12
+lxml>=4.9
+cloudscraper>=1.2
