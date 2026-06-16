@@ -1,0 +1,76 @@
+Date,Country,Title,Impact,Forecast,Previous
+2026-06-07 09:15:00,All,OPEC-JMMC Meetings,Medium,,
+2026-06-07 10:15:00,All,OPEC Meetings,Medium,,
+2026-06-07 21:00:00,AUD,Bank Holiday,Holiday,,
+2026-06-07 23:50:00,JPY,Bank Lending y/y,Low,5.6%,5.4%
+2026-06-07 23:50:00,JPY,Current Account,Low,3.26T,3.90T
+2026-06-08 00:03:00,JPY,Final GDP Price Index y/y,Low,3.4%,3.4%
+2026-06-08 00:03:00,JPY,Final GDP q/q,Low,0.3%,0.5%
+2026-06-08 05:00:00,JPY,Economy Watchers Sentiment,Low,41.9,40.8
+2026-06-08 06:00:00,EUR,German Factory Orders m/m,Low,-2.2%,5.0%
+2026-06-08 08:30:00,EUR,Sentix Investor Confidence,Low,-13.8,-16.4
+2026-06-08 22:45:00,NZD,Manufacturing Sales q/q,Low,,0.6%
+2026-06-08 23:01:00,GBP,BRC Retail Sales Monitor y/y,Low,0.8%,-3.4%
+2026-06-08 23:50:00,JPY,M2 Money Stock y/y,Low,2.4%,2.3%
+2026-06-09 00:30:00,AUD,Westpac Consumer Sentiment,Low,,3.5%
+2026-06-09 01:30:00,AUD,NAB Business Confidence,Low,,-24
+2026-06-09 02:32:00,CNY,USD-Denominated Trade Balance,Low,92.1B,84.8B
+2026-06-09 02:33:00,CNY,Trade Balance,Low,625B,586B
+2026-06-09 06:00:00,EUR,German Industrial Production m/m,Low,0.4%,-0.7%
+2026-06-09 06:00:00,EUR,German Trade Balance,Low,15.4B,14.3B
+2026-06-09 06:00:00,JPY,Prelim Machine Tool Orders y/y,Low,,45.1%
+2026-06-09 10:00:00,USD,NFIB Small Business Index,Low,96.0,95.9
+2026-06-09 12:15:00,USD,ADP Weekly Employment Change,Low,,35.8K
+2026-06-09 12:30:00,CAD,Trade Balance,Low,2.5B,1.8B
+2026-06-09 12:30:00,USD,Trade Balance,Low,-56.2B,-60.3B
+2026-06-09 14:00:00,USD,Existing Home Sales,Low,4.07M,4.02M
+2026-06-09 14:00:00,USD,Final Wholesale Inventories m/m,Low,0.6%,0.5%
+2026-06-09 20:30:00,USD,API Weekly Statistical Bulletin,Low,,
+2026-06-09 23:50:00,JPY,PPI y/y,Low,5.6%,4.9%
+2026-06-10 01:30:00,CNY,CPI y/y,Low,1.3%,1.2%
+2026-06-10 01:30:00,CNY,PPI y/y,Low,3.9%,2.8%
+2026-06-10 03:35:00,JPY,30-y Bond Auction,Low,,3.84|3.5
+2026-06-10 08:00:00,EUR,Italian Industrial Production m/m,Low,0.0%,0.7%
+2026-06-10 09:35:00,EUR,German 10-y Bond Auction,Low,,3.16|1.5
+2026-06-10 12:30:00,USD,Core CPI m/m,High,0.3%,0.4%
+2026-06-10 12:30:00,USD,Core CPI y/y,High,2.9%,2.8%
+2026-06-10 12:30:00,USD,CPI m/m,High,0.5%,0.6%
+2026-06-10 12:30:00,USD,CPI y/y,High,4.2%,3.8%
+2026-06-10 13:45:00,CAD,BOC Rate Statement,High,,
+2026-06-10 13:45:00,CAD,Overnight Rate,High,2.25%,2.25%
+2026-06-10 14:30:00,CAD,BOC Press Conference,High,,
+2026-06-10 14:30:00,USD,Crude Oil Inventories,Low,-3.0M,-8.0M
+2026-06-10 17:01:00,USD,10-y Bond Auction,Low,,4.47|2.4
+2026-06-10 17:59:00,USD,Federal Budget Balance,Low,-282.9B,215.0B
+2026-06-10 23:01:00,GBP,RICS House Price Balance,Low,-32%,-34%
+2026-06-10 23:50:00,JPY,BSI Manufacturing Index,Low,4.2,3.8
+2026-06-11 01:00:00,AUD,MI Inflation Expectations,Low,,5.6%
+2026-06-11 09:15:00,EUR,Eurogroup Meetings,Low,,
+2026-06-11 12:15:00,EUR,Main Refinancing Rate,High,2.40%,2.15%
+2026-06-11 12:15:00,EUR,Monetary Policy Statement,High,,
+2026-06-11 12:30:00,CAD,Building Permits m/m,Low,-3.7%,10.3%
+2026-06-11 12:30:00,USD,Core PPI m/m,High,0.5%,1.0%
+2026-06-11 12:30:00,USD,PPI m/m,High,0.7%,1.4%
+2026-06-11 12:30:00,USD,Unemployment Claims,Medium,220K,225K
+2026-06-11 12:45:00,EUR,ECB Press Conference,High,,
+2026-06-11 14:30:00,USD,Natural Gas Storage,Low,101B,95B
+2026-06-11 17:01:00,USD,30-y Bond Auction,Low,,5.05|2.3
+2026-06-11 22:30:00,NZD,BusinessNZ Manufacturing Index,Low,,50.5
+2026-06-11 22:45:00,NZD,Visitor Arrivals m/m,Low,,-3.0%
+2026-06-12 04:30:00,JPY,Revised Industrial Production m/m,Low,0.9%,0.8%
+2026-06-12 06:00:00,EUR,German Final CPI m/m,Low,-0.2%,-0.2%
+2026-06-12 06:00:00,GBP,GDP m/m,High,-0.1%,0.3%
+2026-06-12 06:00:00,GBP,Construction Output m/m,Low,-0.7%,1.5%
+2026-06-12 06:00:00,GBP,Goods Trade Balance,Low,-22.5B,-27.2B
+2026-06-12 06:00:00,GBP,Index of Services 3m/3m,Low,0.8%,0.8%
+2026-06-12 06:00:00,GBP,Industrial Production m/m,Low,0.1%,-0.2%
+2026-06-12 06:00:00,GBP,Manufacturing Production m/m,Low,-0.2%,1.2%
+2026-06-12 06:45:00,EUR,French Final CPI m/m,Low,0.1%,0.1%
+2026-06-12 08:30:00,GBP,Consumer Inflation Expectations,Low,,3.2%
+2026-06-12 09:00:00,CNY,M2 Money Supply y/y,Low,8.6%,8.6%
+2026-06-12 09:00:00,CNY,New Loans,Low,450B,-10B
+2026-06-12 09:15:00,EUR,ECOFIN Meetings,Low,,
+2026-06-12 13:30:00,GBP,CB Leading Index m/m,Low,,-0.7%
+2026-06-12 14:00:00,USD,Prelim UoM Consumer Sentiment,Medium,46.1,48.2
+2026-06-12 14:00:00,USD,Prelim UoM Inflation Expectations,Medium,,4.5%
+2026-06-12 14:30:00,EUR,German Buba President Nagel Speaks,Low,,

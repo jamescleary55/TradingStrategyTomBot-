@@ -1,0 +1,8 @@
+backtesting>=0.3.3
+pandas>=1.5,<3.0
+numpy>=1.23
+yfinance>=0.2.40
+requests>=2.31
+plotly>=5.18
+bokeh>=3.1
+kaleido>=0.2.1

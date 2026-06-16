@@ -1,0 +1,330 @@
+//@version=6
+// =============================================================================
+//  ICT Strategy - Market Structure + Liquidity + FVG
+//  BOS / CHoCH  *  Equal Highs/Lows  *  Liquidity Sweeps  *  Fair Value Gaps
+//
+//  Entry model
+//    LONG : bullish liquidity sweep  +  bullish CHoCH  +  bullish FVG
+//           -> limit entry at the 50% of the FVG, stop below the sweep low
+//    SHORT: bearish liquidity sweep  +  bearish CHoCH  +  bearish FVG
+//           -> limit entry at the 50% of the FVG, stop above the sweep high
+//
+//  Risk: fixed % of equity per trade, min 1:RR target, optional ATR trail.
+//  Paste into TradingView -> Pine Editor -> Add to chart. Works on any symbol
+//  (BTCUSDT, ETHUSDT, EURUSD, SPY, ...) and any timeframe.
+// =============================================================================
+strategy("ICT Strategy (BOS/CHoCH + Liquidity + FVG)",
+     overlay              = true,
+     pyramiding           = 0,
+     initial_capital      = 100000,
+     default_qty_type     = strategy.fixed,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.04,
+     max_boxes_count      = 500,
+     max_lines_count      = 500,
+     max_labels_count     = 500)
+
+// ----------------------------------------------------------------------------
+//  Inputs
+// ----------------------------------------------------------------------------
+grpS  = "Market Structure"
+swingL = input.int(3,  "Swing left",  minval=1, group=grpS)
+swingR = input.int(3,  "Swing right", minval=1, group=grpS)
+
+grpL  = "Liquidity"
+eqTol      = input.float(0.10, "Equal H/L tolerance %", step=0.01, group=grpL) / 100.0
+sweepLkbk  = input.int(30, "Sweep validity (bars)",  minval=1, group=grpL)
+
+grpF  = "Fair Value Gap"
+minFvg     = input.float(0.08, "Min FVG size %", step=0.01, group=grpF) / 100.0
+chochLkbk  = input.int(20, "CHoCH validity (bars)", minval=1, group=grpF)
+
+grpR  = "Risk Management"
+riskPerc   = input.float(1.0, "Risk per trade %", step=0.25, group=grpR) / 100.0
+rr         = input.float(3.0, "Risk : Reward", step=0.5, minval=1.0, group=grpR)
+slBuf      = input.float(0.05, "Stop buffer %", step=0.01, group=grpR) / 100.0
+entryValid = input.int(10, "Entry valid (bars)", minval=1, group=grpR)
+useTrail   = input.bool(false, "Use trailing stop", group=grpR)
+atrLen     = input.int(14, "ATR length", group=grpR)
+trailMult  = input.float(2.0, "Trail ATR mult", step=0.5, group=grpR)
+
+// Signal-quality filters - defaults mirror config.py (cooldown ON; the
+// sequence + EMA-bias filters reduced returns in testing so default OFF).
+grpQ  = "Signal Filters"
+cooldown = input.int(6, "Signal cooldown (bars)", minval=0, group=grpQ)
+reqSeq   = input.bool(false, "Require sweep -> CHoCH -> FVG order", group=grpQ)
+biasEma  = input.int(0, "Bias EMA period (0 = off)", minval=0, group=grpQ)
+
+// Long-only index model (mirrors config.py: long_only / use_htf_filter /
+// htf_ema_period / htf_timeframe).
+grpX  = "Index / Long-Only Mode"
+longOnly  = input.bool(true,  "Long only (block all shorts)", group=grpX)
+useHtf    = input.bool(true,  "Use HTF trend filter",        group=grpX)
+htfTF     = input.timeframe("1D", "HTF timeframe",           group=grpX)
+htfLen    = input.int(50, "HTF EMA period", minval=1,        group=grpX)
+
+grpV  = "Visualization"
+showFVG    = input.bool(true,  "Show FVG zones",   group=grpV)
+showStruct = input.bool(true,  "Show BOS / CHoCH", group=grpV)
+showSweep  = input.bool(true,  "Show sweeps",      group=grpV)
+showLevels = input.bool(true,  "Show entry/SL/TP", group=grpV)
+boxExtend  = input.int(15, "FVG box extend (bars)", group=grpV)
+
+// ----------------------------------------------------------------------------
+//  Swing pivots
+// ----------------------------------------------------------------------------
+ph = ta.pivothigh(swingL, swingR)   // confirmed swingR bars back
+pl = ta.pivotlow(swingL, swingR)
+
+// Most recent confirmed pivots (kept for sweeps + equal levels).
+var float recentSH = na
+var float recentSL = na
+if not na(ph)
+    recentSH := ph
+if not na(pl)
+    recentSL := pl
+
+// ----------------------------------------------------------------------------
+//  Market structure: BOS & CHoCH
+// ----------------------------------------------------------------------------
+var float structSH = na   // unbroken swing high used for breaks
+var float structSL = na
+var int   trend    = 0
+
+if not na(ph)
+    structSH := ph
+if not na(pl)
+    structSL := pl
+
+bool bosUp   = false
+bool bosDn   = false
+bool chochUp = false
+bool chochDn = false
+
+if not na(structSH) and close > structSH
+    if trend <= 0
+        chochUp := true
+    else
+        bosUp := true
+    trend    := 1
+    structSH := na
+else if not na(structSL) and close < structSL
+    if trend >= 0
+        chochDn := true
+    else
+        bosDn := true
+    trend    := -1
+    structSL := na
+
+// Remember when the last CHoCH happened.
+var int lastChochUpBar = na
+var int lastChochDnBar = na
+if chochUp
+    lastChochUpBar := bar_index
+if chochDn
+    lastChochDnBar := bar_index
+
+// ----------------------------------------------------------------------------
+//  Equal highs / equal lows (liquidity pools)
+// ----------------------------------------------------------------------------
+var float prevPH = na
+var float prevPL = na
+bool  eqHigh = false
+bool  eqLow  = false
+float eqHighLvl = na
+float eqLowLvl  = na
+
+if not na(ph)
+    if not na(prevPH) and math.abs(ph - prevPH) / ph <= eqTol
+        eqHigh    := true
+        eqHighLvl := math.avg(ph, prevPH)
+    prevPH := ph
+if not na(pl)
+    if not na(prevPL) and math.abs(pl - prevPL) / pl <= eqTol
+        eqLow    := true
+        eqLowLvl := math.avg(pl, prevPL)
+    prevPL := pl
+
+// ----------------------------------------------------------------------------
+//  Liquidity sweeps (stop hunts)
+//    bullish: wick below a recent low, body closes back above
+//    bearish: wick above a recent high, body closes back below
+// ----------------------------------------------------------------------------
+bodyTop = math.max(open, close)
+bodyBot = math.min(open, close)
+
+bool sweepBull = not na(recentSL) and low  < recentSL and bodyBot > recentSL
+bool sweepBear = not na(recentSH) and high > recentSH and bodyTop < recentSH
+
+var int   lastSweepBullBar = na
+var float lastSweepBullLow = na
+var int   lastSweepBearBar = na
+var float lastSweepBearHigh = na
+if sweepBull
+    lastSweepBullBar := bar_index
+    lastSweepBullLow := low
+if sweepBear
+    lastSweepBearBar := bar_index
+    lastSweepBearHigh := high
+
+// ----------------------------------------------------------------------------
+//  Fair Value Gaps (3-candle imbalance, completed on the current bar)
+// ----------------------------------------------------------------------------
+bool fvgBull = high[2] < low and (low - high[2]) / close >= minFvg
+bool fvgBear = low[2]  > high and (low[2] - high) / close >= minFvg
+
+float fvgTop = fvgBull ? low    : fvgBear ? low[2] : na
+float fvgBot = fvgBull ? high[2]: fvgBear ? high   : na
+float fvgMid = na
+if fvgBull or fvgBear
+    fvgMid := math.avg(fvgTop, fvgBot)
+
+// ----------------------------------------------------------------------------
+//  Setups (confluence within validity windows)
+// ----------------------------------------------------------------------------
+bool sweepBullFresh = not na(lastSweepBullBar) and (bar_index - lastSweepBullBar) <= sweepLkbk
+bool chochUpFresh   = not na(lastChochUpBar)   and (bar_index - lastChochUpBar)   <= chochLkbk
+bool sweepBearFresh = not na(lastSweepBearBar) and (bar_index - lastSweepBearBar) <= sweepLkbk
+bool chochDnFresh   = not na(lastChochDnBar)   and (bar_index - lastChochDnBar)   <= chochLkbk
+
+// Optional ICT event ordering: the stop-hunt must occur on/before the CHoCH.
+bool seqOkLong  = not reqSeq or (not na(lastSweepBullBar) and not na(lastChochUpBar) and lastSweepBullBar <= lastChochUpBar)
+bool seqOkShort = not reqSeq or (not na(lastSweepBearBar) and not na(lastChochDnBar) and lastSweepBearBar <= lastChochDnBar)
+
+// Optional higher-timeframe EMA bias (0 disables; guard length >= 1).
+emaVal = ta.ema(close, math.max(biasEma, 1))
+bool biasOkLong  = biasEma <= 1 or close > emaVal
+bool biasOkShort = biasEma <= 1 or close < emaVal
+
+// Higher-timeframe trend regime: bullish when HTF close > HTF EMA.  Uses the
+// last CONFIRMED HTF values (lookahead_off, no repaint) -> longs only in a
+// bullish daily regime, matching the Python signals.htf_bull_regime() filter.
+htfClose = request.security(syminfo.tickerid, htfTF, close,             lookahead = barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htfTF, ta.ema(close, htfLen), lookahead = barmerge.lookahead_off)
+bool htfBull = not useHtf or (htfClose > htfEma)
+
+bool longSetupRaw  = fvgBull and sweepBullFresh and chochUpFresh and seqOkLong  and biasOkLong and htfBull
+bool shortSetupRaw = fvgBear and sweepBearFresh and chochDnFresh and seqOkShort and biasOkShort
+
+// Cooldown: suppress new signals for `cooldown` bars after the last one.
+var int lastSignalBar = na
+bool cooldownOk = na(lastSignalBar) or (bar_index - lastSignalBar) >= cooldown
+
+bool longSetup  = longSetupRaw  and cooldownOk
+bool shortSetup = shortSetupRaw and cooldownOk
+if longSetup or shortSetup
+    lastSignalBar := bar_index
+
+// Levels
+float entryL = fvgMid
+float slL    = na
+float tpL    = na
+if longSetup
+    slL := lastSweepBullLow * (1.0 - slBuf)
+    tpL := entryL + rr * (entryL - slL)
+
+float entryS = fvgMid
+float slS    = na
+float tpS    = na
+if shortSetup
+    slS := lastSweepBearHigh * (1.0 + slBuf)
+    tpS := entryS - rr * (slS - entryS)
+
+atrVal = ta.atr(atrLen)   // computed every bar for consistency
+
+// Position size so the loss at the stop == riskPerc of equity.
+f_qty(_entry, _stop) =>
+    d = math.abs(_entry - _stop)
+    d > 0 ? (strategy.equity * riskPerc) / d : na
+
+// ----------------------------------------------------------------------------
+//  Order management - one setup at a time, pending limit expires after N bars
+// ----------------------------------------------------------------------------
+var bool pending    = false
+var int  pendingBar = na
+
+flat = strategy.position_size == 0
+
+// A fill clears the pending flag.
+if pending and not flat
+    pending := false
+
+// Expire a stale pending limit entry.
+if pending and flat and not na(pendingBar) and (bar_index - pendingBar) >= entryValid
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pending := false
+
+canEnter = flat and not pending
+trailTicks = trailMult * atrVal / syminfo.mintick
+
+if canEnter and longSetup and slL < entryL and entryL < tpL
+    q = f_qty(entryL, slL)
+    if not na(q) and q > 0
+        strategy.entry("Long", strategy.long, qty=q, limit=entryL)
+        if useTrail
+            strategy.exit("Long-X", "Long", stop=slL, limit=tpL, trail_price=entryL, trail_offset=trailTicks)
+        else
+            strategy.exit("Long-X", "Long", stop=slL, limit=tpL)
+        pending    := true
+        pendingBar := bar_index
+
+// Short execution is blocked entirely when longOnly is on (the SELL setup is
+// still computed/plotted above for analysis, but never sent as an order).
+if not longOnly and canEnter and shortSetup and tpS < entryS and entryS < slS
+    q = f_qty(entryS, slS)
+    if not na(q) and q > 0
+        strategy.entry("Short", strategy.short, qty=q, limit=entryS)
+        if useTrail
+            strategy.exit("Short-X", "Short", stop=slS, limit=tpS, trail_price=entryS, trail_offset=trailTicks)
+        else
+            strategy.exit("Short-X", "Short", stop=slS, limit=tpS)
+        pending    := true
+        pendingBar := bar_index
+
+// ----------------------------------------------------------------------------
+//  Visualization
+// ----------------------------------------------------------------------------
+// FVG zones
+if showFVG and fvgBull
+    box.new(bar_index - 2, fvgTop, bar_index + boxExtend, fvgBot,
+         border_color = color.new(color.teal, 40),
+         bgcolor      = color.new(color.teal, 85))
+if showFVG and fvgBear
+    box.new(bar_index - 2, fvgTop, bar_index + boxExtend, fvgBot,
+         border_color = color.new(color.red, 40),
+         bgcolor      = color.new(color.red, 85))
+
+// Equal-level liquidity pools
+plotshape(showSweep and eqHigh, title="EQH", style=shape.xcross, location=location.abovebar, color=color.gray, size=size.tiny)
+plotshape(showSweep and eqLow,  title="EQL", style=shape.xcross, location=location.belowbar, color=color.gray, size=size.tiny)
+
+// Structure
+plotshape(showStruct and bosUp,   title="BOS up",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.tiny, text="BOS")
+plotshape(showStruct and bosDn,   title="BOS dn",   style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0),   size=size.tiny, text="BOS")
+plotshape(showStruct and chochUp, title="CHoCH up", style=shape.diamond,      location=location.belowbar, color=color.new(color.lime, 0),  size=size.tiny, text="CHoCH")
+plotshape(showStruct and chochDn, title="CHoCH dn", style=shape.diamond,      location=location.abovebar, color=color.new(color.maroon, 0),size=size.tiny, text="CHoCH")
+
+// Sweeps
+plotshape(showSweep and sweepBull, title="Sweep low",  style=shape.flag, location=location.belowbar, color=color.new(color.blue, 0),   size=size.tiny)
+plotshape(showSweep and sweepBear, title="Sweep high", style=shape.flag, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny)
+
+// Entries
+plotshape(longSetup,  title="BUY",  style=shape.labelup,   location=location.belowbar, color=color.new(color.green, 0), textcolor=color.white, text="BUY",  size=size.small)
+plotshape(shortSetup, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0),   textcolor=color.white, text="SELL", size=size.small)
+
+// Entry / SL / TP guide lines on the setup bar
+if showLevels and longSetup
+    line.new(bar_index, entryL, bar_index + entryValid, entryL, color=color.yellow, style=line.style_dotted)
+    line.new(bar_index, slL,    bar_index + entryValid, slL,    color=color.red,    style=line.style_dotted)
+    line.new(bar_index, tpL,    bar_index + entryValid, tpL,    color=color.green,  style=line.style_dotted)
+if showLevels and shortSetup
+    line.new(bar_index, entryS, bar_index + entryValid, entryS, color=color.yellow, style=line.style_dotted)
+    line.new(bar_index, slS,    bar_index + entryValid, slS,    color=color.red,    style=line.style_dotted)
+    line.new(bar_index, tpS,    bar_index + entryValid, tpS,    color=color.green,  style=line.style_dotted)
+
+// ----------------------------------------------------------------------------
+//  Alerts
+// ----------------------------------------------------------------------------
+alertcondition(longSetup,  title="ICT Long",  message="ICT LONG setup on {{ticker}} @ {{close}}")
+alertcondition(shortSetup, title="ICT Short", message="ICT SHORT setup on {{ticker}} @ {{close}}")
