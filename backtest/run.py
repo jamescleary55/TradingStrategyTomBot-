@@ -255,8 +255,10 @@ def main():
     parser.add_argument("--ledger", action="store_true", help="Write trades.csv ledger next to the chart")
     parser.add_argument("--out-dir", default="charts", help="Output directory")
     parser.add_argument("--source", default="auto",
-                        choices=["auto", "tradovate", "yfinance", "synthetic"],
-                        help="OHLCV data source (auto = tradovate if creds else yfinance).")
+                        choices=["auto", "ibkr", "tradovate", "yfinance", "synthetic", "local"],
+                        help="OHLCV data source. 'local' = checked-in market_data/ CSVs "
+                             "(incl. James's 2-yr crypto/equity history). "
+                             "auto = ibkr/tradovate if configured else yfinance.")
     parser.add_argument("--bars", type=int, default=250,
                         help="Visible bars on the price chart (last N). Use 0 for all.")
     parser.add_argument("--show-all-fvgs", action="store_true",

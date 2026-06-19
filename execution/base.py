@@ -7,7 +7,7 @@ the interface, so swapping brokers is a single line in ``.env``.
 
 Resolution order for ``get_adapter()``:
 
-    BROKER env var → "tradovate" (default) | "topstepx" | "dryrun"
+    BROKER env var → "ibkr" (default) | "tradovate" | "topstepx" | "dryrun"
 
 The ``dryrun`` adapter never sends anything to a real venue — useful
 for smoke tests and offline development.
@@ -156,9 +156,12 @@ def get_adapter(name: Optional[str] = None) -> BrokerAdapter:
     Lazy-imports the concrete adapter module so the wrong creds never
     cause an import-time failure for users not on that broker.
     """
-    name = (name or os.getenv("BROKER", "tradovate")).strip().lower()
+    name = (name or os.getenv("BROKER", "ibkr")).strip().lower()
     if name == "dryrun":
         return DryRunAdapter()
+    if name == "ibkr":
+        from execution.ibkr_orders import IBKRAdapter
+        return IBKRAdapter()
     if name == "tradovate":
         from execution.tradovate_orders import TradovateAdapter
         return TradovateAdapter()

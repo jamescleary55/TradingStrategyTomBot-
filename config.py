@@ -137,3 +137,38 @@ def tradovate_md_ws() -> str:
 
 def has_tradovate_credentials() -> bool:
     return bool(TRADOVATE_USERNAME and TRADOVATE_PASSWORD and TRADOVATE_CID and TRADOVATE_SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Interactive Brokers (IBKR) connection (from .env)
+# ---------------------------------------------------------------------------
+# IBKR is reached over a local socket to a running TWS or IB Gateway — there is
+# no API username/secret in .env (you log in inside TWS/Gateway). "Credentials"
+# here therefore means: the user has opted into IBKR and a socket port is set.
+# Common ports: 7497 TWS paper | 7496 TWS live | 4002 Gateway paper | 4001 Gateway live
+IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
+IB_PORT = int(os.getenv("IB_PORT", "7497"))
+IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "17"))
+
+# Paper vs live is inferred from the port (paper = 7497 TWS / 4002 Gateway).
+# Set IB_ENV=live explicitly to bypass the paper-only rail in execution/ibkr_orders.py.
+IB_ENV = os.getenv("IB_ENV", "").strip().lower() or (
+    "paper" if IB_PORT in (7497, 4002) else "live"
+)
+
+# IBKR exchange per instrument root. Index futures = CME; energy = NYMEX;
+# metals = COMEX. Crypto roots are not IBKR-routable and stay on yfinance/synthetic.
+IB_EXCHANGE: dict[str, str] = {
+    "NQ": "CME", "MNQ": "CME", "ES": "CME", "MES": "CME",
+    "CL": "NYMEX", "MCL": "NYMEX", "GC": "COMEX", "MGC": "COMEX",
+}
+
+
+def has_ibkr_credentials() -> bool:
+    """IBKR has no API secret, so 'configured' means the user opted in via .env.
+
+    True when ``BROKER=ibkr`` or an ``IB_PORT`` is explicitly set. We can't prove
+    the socket is actually live without connecting; the loader and order adapter
+    surface the real connection error if TWS/Gateway isn't running.
+    """
+    return os.getenv("BROKER", "").strip().lower() == "ibkr" or bool(os.getenv("IB_PORT"))

@@ -1,11 +1,13 @@
 """Local CSV historical feed.
 
-Reads OHLCV CSVs produced by ``scripts/bulk_download.py`` from
-``~/.ict-bot/historical/``. File names follow the pattern
-``<source>_<symbol>_<timeframe>.csv`` (e.g. ``binance_BTCUSDT_1h.csv``).
+Reads OHLCV CSVs from two locations, in order:
 
-Used for backtests over downloaded crypto / equity history without
-re-hitting external APIs.
+1. ``~/.ict-bot/historical/`` — user dumps from ``scripts/bulk_download.py``
+2. ``<repo>/market_data/``    — checked-in history (e.g. James's 2-yr CSVs)
+
+File names follow the pattern ``<source>_<symbol>_<timeframe>.csv`` (e.g.
+``binance_BTCUSDT_1h.csv``). Used for backtests over downloaded crypto / equity
+history without re-hitting external APIs.
 """
 from __future__ import annotations
 
@@ -18,16 +20,17 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 HISTORICAL_DIR = Path.home() / ".ict-bot" / "historical"
+REPO_MARKET_DATA = Path(__file__).resolve().parent.parent / "market_data"
+SEARCH_DIRS = (HISTORICAL_DIR, REPO_MARKET_DATA)
 
 
 def _candidate_paths(symbol: str, timeframe: str) -> list[Path]:
     """All files that could plausibly hold this symbol+timeframe."""
     sym = symbol.upper().replace("/", "_")
-    if not HISTORICAL_DIR.exists():
-        return []
     paths = []
-    for p in HISTORICAL_DIR.glob(f"*_{sym}_{timeframe}.csv"):
-        paths.append(p)
+    for d in SEARCH_DIRS:
+        if d.exists():
+            paths.extend(d.glob(f"*_{sym}_{timeframe}.csv"))
     return paths
 
 

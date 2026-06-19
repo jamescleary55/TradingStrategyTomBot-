@@ -32,6 +32,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_BINANCE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 DEFAULT_FMP_SYMBOLS = ["SPY", "QQQ", "AAPL", "MSFT", "TSLA", "NVDA"]
+DEFAULT_YF_SYMBOLS = ["NQ", "ES", "CL", "GC"]   # index/commodity futures (mapped to =F)
 
 
 def _save_csv(df, source: str, symbol: str, interval: str) -> Path:
@@ -55,12 +56,14 @@ def _summary_table(rows: list[dict]) -> Table:
 def main():
     parser = argparse.ArgumentParser(description="Bulk OHLCV downloader")
     parser.add_argument("--source", default="binance",
-                        choices=["binance", "fmp", "both"])
+                        choices=["binance", "fmp", "yfinance", "both", "all"],
+                        help="'both' = binance+fmp (legacy); 'all' = +yfinance")
     parser.add_argument("--interval", default="1h",
                         help="1m / 5m / 15m / 30m / 1h / 4h / 1d")
     parser.add_argument("--years", type=float, default=2.0)
     parser.add_argument("--binance-symbols", default=",".join(DEFAULT_BINANCE_SYMBOLS))
     parser.add_argument("--fmp-symbols", default=",".join(DEFAULT_FMP_SYMBOLS))
+    parser.add_argument("--yf-symbols", default=",".join(DEFAULT_YF_SYMBOLS))
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -69,7 +72,7 @@ def main():
     days = int(args.years * 365.25)
     rows: list[dict] = []
 
-    if args.source in ("binance", "both"):
+    if args.source in ("binance", "both", "all"):
         from data.binance_feed import get_klines, _now_ms, INTERVAL_MS
         if args.interval not in INTERVAL_MS:
             log.error("Binance interval %s not supported", args.interval); sys.exit(1)
@@ -88,7 +91,27 @@ def main():
             })
             log.info("[Binance] %s → %d rows → %s", sym, len(df), path)
 
-    if args.source in ("fmp", "both"):
+    if args.source in ("yfinance", "all"):
+        from data.yfinance_feed import get_bars as yf_get_bars, SYMBOL_MAP
+        for sym in [s.strip().upper() for s in args.yf_symbols.split(",") if s.strip()]:
+            if sym not in SYMBOL_MAP:
+                log.warning("[yfinance] %s has no Yahoo mapping — skipping", sym); continue
+            log.info("[yfinance] %s %s × %.1fy (Yahoo caps short intervals)", sym, args.interval, args.years)
+            try:
+                df = yf_get_bars(sym, args.interval, days=days)
+            except Exception as e:
+                log.warning("[yfinance] %s failed: %s", sym, e); continue
+            if df.empty:
+                log.warning("[yfinance] %s returned no rows", sym); continue
+            path = _save_csv(df, "yfinance", sym, args.interval)
+            rows.append({
+                "source": "yfinance", "symbol": sym, "interval": args.interval,
+                "rows": len(df), "from": str(df.index[0]), "to": str(df.index[-1]),
+                "path": str(path),
+            })
+            log.info("[yfinance] %s → %d rows → %s", sym, len(df), path)
+
+    if args.source in ("fmp", "both", "all"):
         import os
         if not os.getenv("FMP_API_KEY"):
             log.error("FMP_API_KEY not set in .env — skipping FMP")

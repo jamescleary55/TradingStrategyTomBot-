@@ -7,5 +7,6 @@ venv/
 .DS_Store
 *.csv
 !sample_*.csv
+!market_data/*.csv
 charts/
 data_cache/

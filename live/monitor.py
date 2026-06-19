@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config as cfg
 from data.loader import load_bars
+from execution.base import get_adapter
 from live.forward_log import log_signal, log_skipped, log_trade_attempt
 from risk.controls import RiskGate
 from risk.rules import PersonalRules, load as load_rules
@@ -214,13 +215,13 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
                     alerter.notify(f"Order skipped ({spec.symbol})",
                                    f"sizing: {plan.reason}", severity="warning")
                     continue
-                from execution.tradovate_orders import place_bracket_for_setup
-                result = place_bracket_for_setup(
+                adapter = get_adapter()           # BROKER env → ibkr | tradovate | topstepx | dryrun
+                result = adapter.place_bracket_for_setup(
                     s.native, plan, instrument,
                     allow_live=spec.allow_live, dry_run=spec.execute_dry_run,
                 )
                 log_trade_attempt(
-                    strategy_setup=s, plan=plan, broker_name="tradovate",
+                    strategy_setup=s, plan=plan, broker_name=adapter.name,
                     intended_entry=s.entry, intended_stop=s.stop,
                     intended_target=s.target, planned_R=s.rr,
                     risk_usd=plan.total_risk_usd, contracts=plan.contracts,
@@ -231,8 +232,10 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
                                f"Bracket #{result.order_id} qty {plan.contracts}",
                                severity="success")
             except Exception as ex:
+                import os as _os
                 log_trade_attempt(
-                    strategy_setup=s, plan=None, broker_name="tradovate",
+                    strategy_setup=s, plan=None,
+                    broker_name=_os.getenv("BROKER", "ibkr").strip().lower(),
                     intended_entry=s.entry, intended_stop=s.stop,
                     intended_target=s.target, planned_R=s.rr,
                     risk_usd=0.0, contracts=0, outcome="failed", error=str(ex),

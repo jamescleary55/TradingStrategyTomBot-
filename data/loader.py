@@ -3,8 +3,9 @@
     load_bars(symbol, timeframe, days, source="auto")
 
 ``source="auto"`` picks the first source that yields rows:
-``tradovate`` if creds are present, otherwise ``yfinance``, otherwise the
-synthetic fallback (last resort, only for offline harness checks).
+``ibkr`` if IBKR is configured (BROKER=ibkr / IB_PORT set), else ``tradovate``
+if creds are present, otherwise ``yfinance``, otherwise the synthetic fallback
+(last resort, only for offline harness checks).
 """
 from __future__ import annotations
 
@@ -13,12 +14,12 @@ from typing import Literal
 
 import pandas as pd
 
-from config import has_tradovate_credentials
+from config import has_ibkr_credentials, has_tradovate_credentials
 from data import local_csv, tradovate_feed, yfinance_feed
 
 log = logging.getLogger(__name__)
 
-Source = Literal["auto", "tradovate", "yfinance", "synthetic", "local"]
+Source = Literal["auto", "ibkr", "tradovate", "yfinance", "synthetic", "local"]
 
 
 def load_bars(symbol: str, timeframe: str, days: int = 30,
@@ -27,9 +28,24 @@ def load_bars(symbol: str, timeframe: str, days: int = 30,
         return local_csv.get_bars(symbol, timeframe, days=days)
 
     if source == "auto":
-        if has_tradovate_credentials():
+        if has_ibkr_credentials():
+            source = "ibkr"
+        elif has_tradovate_credentials():
             source = "tradovate"
         else:
+            source = "yfinance"
+
+    if source == "ibkr":
+        # Lazy import: ib_async/ib_insync may not be installed for non-IBKR users.
+        from data import ibkr_feed
+        try:
+            df = ibkr_feed.get_bars(symbol, timeframe, days=days)
+            if not df.empty:
+                return df
+            log.error("IBKR returned empty for %s %s — falling back to yfinance", symbol, timeframe)
+            source = "yfinance"
+        except Exception as e:
+            log.error("IBKR error: %s — falling back to yfinance", e)
             source = "yfinance"
 
     if source == "tradovate":

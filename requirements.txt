@@ -8,6 +8,10 @@ matplotlib>=3.7
 pytz>=2023.3
 rich>=13.7
 yfinance>=0.2.40
+# IBKR data feed + order execution (TWS/IB Gateway socket API).
+# ib_async is the maintained fork but needs Python 3.10+; ib_insync covers 3.9.
+ib_async>=1.0    ; python_version >= "3.10"
+ib_insync>=0.9.86 ; python_version <  "3.10"
 flask>=3.0
 pyyaml>=6.0
 pytest>=7.4
