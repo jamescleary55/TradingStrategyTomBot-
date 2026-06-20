@@ -69,6 +69,36 @@ def _save_state(symbol: str, tf: str, state: dict) -> None:
     _state_path(symbol, tf).write_text(json.dumps(state, indent=2))
 
 
+# Runtime descriptor so the dashboard's ops panel can show what is actually
+# running (mode / AUTO_PAPER_SAFE / market-data status / liveness). Written at
+# startup, removed on clean shutdown; the reader verifies the PID is alive.
+RUNTIME_FILE = STATE_DIR / "monitor-runtime.json"
+
+
+def _write_runtime(*, mode: str, auto_execute: bool, symbols: list,
+                   data_status: dict, kill_switch_path: str) -> None:
+    import os as _os
+    try:
+        RUNTIME_FILE.write_text(json.dumps({
+            "pid": _os.getpid(),
+            "started_at": dt.datetime.utcnow().isoformat() + "Z",
+            "mode": mode,
+            "auto_execute": bool(auto_execute),
+            "symbols": symbols,
+            "data_status": data_status,
+            "kill_switch_path": kill_switch_path,
+        }, indent=2))
+    except Exception:
+        log.warning("could not write runtime descriptor", exc_info=True)
+
+
+def _clear_runtime() -> None:
+    try:
+        RUNTIME_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # Legacy alerts.jsonl writer was removed; everything now flows through
 # live/forward_log.py (live_signals.jsonl / skipped_setups.jsonl /
 # live_trades.jsonl). The tracker module is kept for migrating older
@@ -481,6 +511,10 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    _write_runtime(mode=mode, auto_execute=args.auto_execute,
+                   symbols=[sim for _s, sim in pairs], data_status=data_status_by_sym,
+                   kill_switch_path=rules.kill_switch_path)
+
     if args.once:
         total = 0
         for spec in specs:
@@ -490,6 +524,7 @@ def main():
                      spec.symbol, n, state.get("n_alerts", 0))
             total += n
         log.info("Combined one-shot: %d new alert(s) across %d symbol(s)", total, len(specs))
+        _clear_runtime()
         return
 
     # One thread per symbol, sharing the alerter (rich Console is thread-safe)
@@ -507,6 +542,7 @@ def main():
     log.info("Stopping... draining %d watcher(s).", len(threads))
     for t in threads:
         t.join(timeout=3)
+    _clear_runtime()
     log.info("Stopped (Ctrl-C). Bye.")
 
 

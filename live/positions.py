@@ -143,7 +143,8 @@ def _diff_and_alert(state: PrevState, snapshot, alerter: Alerter) -> int:
 def main():
     parser = argparse.ArgumentParser(description="Live broker position poller")
     parser.add_argument("--poll", type=int, default=30, help="Seconds between snapshots")
-    parser.add_argument("--account-id", type=int, default=None)
+    parser.add_argument("--account-id", default=None,
+                        help="Account id (string; broker ids are alphanumeric)")
     parser.add_argument("--broker", default=None, help="Override BROKER env var")
     parser.add_argument("--once", action="store_true",
                         help="One snapshot then exit (for smoke tests)")
