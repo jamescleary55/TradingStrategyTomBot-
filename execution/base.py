@@ -66,7 +66,7 @@ class ExecutionEvent:
     Shaped so the reconciler can match it to the trade-attempt row by
     ``order_id`` (or its child IDs for OSO brackets).
     """
-    execution_id: str            # broker-side ID
+    execution_id: str            # broker-side execution ID (IBKR execId) — primary key
     order_id: str                # parent order id (or this fill's id)
     parent_order_id: Optional[str] = None   # for bracket children
     timestamp: str = ""          # ISO UTC
@@ -76,6 +76,8 @@ class ExecutionEvent:
     price: float = 0.0
     commission: float = 0.0
     kind: str = "fill"           # fill | partial | reject | cancel
+    perm_id: Optional[str] = None   # broker-permanent order id (survives reconnects)
+    account: Optional[str] = None   # account the execution belongs to (string)
     raw: Any = None
 
 

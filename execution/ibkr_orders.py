@@ -250,6 +250,7 @@ class IBKRAdapter(BrokerAdapter):
                 comm = 0.0
                 if getattr(f, "commissionReport", None) is not None:
                     comm = float(getattr(f.commissionReport, "commission", 0.0) or 0.0)
+                perm = getattr(ex, "permId", None)
                 events.append(ExecutionEvent(
                     execution_id=str(getattr(ex, "execId", "")),
                     order_id=str(getattr(ex, "orderId", "")),
@@ -261,6 +262,8 @@ class IBKRAdapter(BrokerAdapter):
                     price=float(getattr(ex, "price", 0.0) or 0.0),
                     commission=comm,
                     kind="fill",
+                    perm_id=str(perm) if perm not in (None, "") else None,
+                    account=str(getattr(ex, "acctNumber", "")) or None,
                     raw=f,
                 ))
             events.sort(key=lambda e: e.timestamp)
