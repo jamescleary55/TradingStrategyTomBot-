@@ -82,11 +82,29 @@ python -m live.server --port 5005     # dashboard (dedicated IBKR client id 91)
 # Banner + Ops tab update every 10s; criticals stay until cleared.
 ```
 
-## Remaining operational risks
+## Front-end verification (updated)
 
-- **No live visual capture in this session** — headless-browser screenshot was
-  unavailable; UI verified structurally (endpoint JSON, element-id/function
-  consistency, render 200). Eyeball before the run: `python -m live.server`.
+The dashboard JavaScript is now verified by **executing it in a real JS engine**
+(macOS JavaScriptCore `jsc`), not just structurally:
+
+- All 21 render functions run without error against a **populated dangerous
+  state** (live account, position mismatch, critical alarms, degraded freshness)
+  AND **empty/null states** — all return valid markup.
+- The actual `refresh()` data→render→DOM flow runs end-to-end with mocked fetch:
+  `live_label` becomes `live` (no exception path), the supervision banner renders
+  "SAFE TO SUPERVISE", and all 11 key panels populate.
+
+Run it yourself any time as a pre-flight gate:
+
+```bash
+python scripts/dashboard_selfcheck.py     # endpoints + front-end render → READY/NOT READY
+```
+
+Only the literal CSS pixel layout and tab-click interactions are unverified by
+code (low risk — static CSS, simple tab switch with verified element ids); a
+30-second eyeball in a browser is still worthwhile.
+
+## Remaining operational risks
 - **Open-risk in R is approximated** as net open contracts (≈1R each) rather than
   read from each order's live stop — fine for the 1-lot MES run; revisit if
   scaling.
