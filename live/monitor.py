@@ -22,7 +22,7 @@ import signal
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
@@ -31,7 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config as cfg
 from data.loader import load_bars
 from execution.base import get_adapter
-from live.forward_log import log_signal, log_skipped, log_trade_attempt
+from live.exec_guard import preflight, signal_signature
+from live.forward_log import (
+    EV_ORDER, EV_SIGNAL, EV_SYSTEM,
+    log_event, log_signal, log_skipped, log_trade_attempt,
+)
 from risk.controls import RiskGate
 from risk.rules import PersonalRules, load as load_rules
 from risk.sizing import plan_trade
@@ -91,9 +95,15 @@ class WatchSpec:
     risk_pct: float
     allow_live: bool
     execute_dry_run: bool
-    mode: str = "review"                  # review | paper | live
+    mode: str = "review"                  # review | paper | live | auto_paper_safe
     strategy_name: str = "sweep_choch_fvg"
     rules: Optional[PersonalRules] = None
+    # Execution-gate inputs (Phase 2/5/6). data_status is probed once at startup.
+    data_status: str = "UNKNOWN"
+    data_override: bool = False
+    kill_switch_path: Optional[str] = None
+    # Signatures of setups we've already submitted — duplicate-execution guard.
+    executed_signatures: set = field(default_factory=set)
 
 
 def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
@@ -189,8 +199,12 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
             trade_allowed=trade_allowed,
             skip_reason=skip_reason,
         )
+        log_event(EV_SIGNAL, "detected", symbol=spec.sim_symbol,
+                  direction=s.direction, entry=s.entry, planned_R=s.rr)
         if decision is not None and not decision.allowed:
             log_skipped(strategy_setup=s, reason=decision.reason, rule_name=decision.rule)
+            log_event(EV_SIGNAL, "rejected", symbol=spec.sim_symbol,
+                      severity="info", detail=decision.reason)
 
         # Alert in every mode — operator wants visibility even when blocked
         suffix = ""
@@ -207,7 +221,17 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
 
         # Execute only when mode != review AND auto-execute is on AND risk gate passed
         if spec.mode != "review" and spec.auto_execute and trade_allowed:
+            safe_mode = spec.mode == "auto_paper_safe"
+            gated = spec.mode in ("paper", "auto_paper_safe")
             try:
+                # AUTO_PAPER_SAFE hard restriction: MES only.
+                if safe_mode and spec.sim_symbol.upper() != "MES":
+                    reason = f"AUTO_PAPER_SAFE allows MES only (got {spec.sim_symbol})"
+                    log_skipped(strategy_setup=s, reason=reason, rule_name="auto_paper_safe")
+                    log_event(EV_SYSTEM, "gate_block", symbol=spec.sim_symbol,
+                              severity="warning", detail=reason)
+                    continue
+
                 plan = strategy.build_trade_plan(s, equity=spec.equity,
                                                   risk_pct=spec.risk_pct, min_rr=1.0)
                 if not plan.approved:
@@ -215,11 +239,45 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
                     alerter.notify(f"Order skipped ({spec.symbol})",
                                    f"sizing: {plan.reason}", severity="warning")
                     continue
+
+                # AUTO_PAPER_SAFE: force exactly 1 contract regardless of sizing.
+                if safe_mode:
+                    plan.contracts = 1
+
                 adapter = get_adapter()           # BROKER env → ibkr | tradovate | topstepx | dryrun
+                sig = signal_signature(spec.sim_symbol, s.direction, s.timestamp)
+
+                # MANDATORY execution gate for any paper auto-execution (Phase 2).
+                if gated:
+                    pf = preflight(
+                        adapter=adapter,
+                        mode="paper",                 # auto_paper_safe IS a paper mode
+                        allow_live=spec.allow_live,
+                        symbol=spec.sim_symbol,
+                        order_qty=plan.contracts,
+                        setup_signature=sig,
+                        executed_signatures=spec.executed_signatures,
+                        data_status=spec.data_status,
+                        data_override=spec.data_override,
+                        kill_switch_path=spec.kill_switch_path,
+                    )
+                    if not pf.allowed:
+                        reason = "; ".join(pf.gate.reasons)
+                        log_skipped(strategy_setup=s, reason=reason, rule_name="exec_gate")
+                        alerter.notify(f"Order BLOCKED ({spec.symbol})", reason,
+                                       severity="warning")
+                        continue
+
                 result = adapter.place_bracket_for_setup(
                     s.native, plan, instrument,
                     allow_live=spec.allow_live, dry_run=spec.execute_dry_run,
                 )
+                spec.executed_signatures.add(sig)   # prevent duplicate execution
+                log_event(EV_ORDER, "submitted", symbol=spec.sim_symbol,
+                          order_id=result.order_id, qty=plan.contracts,
+                          entry=s.entry, stop=s.stop, target=s.target)
+                log_event(EV_SIGNAL, "executed", symbol=spec.sim_symbol,
+                          order_id=result.order_id)
                 log_trade_attempt(
                     strategy_setup=s, plan=plan, broker_name=adapter.name,
                     intended_entry=s.entry, intended_stop=s.stop,
@@ -233,6 +291,8 @@ def _tick(spec: WatchSpec, alerter: Alerter, state: dict,
                                severity="success")
             except Exception as ex:
                 import os as _os
+                log_event(EV_ORDER, "failed", symbol=spec.sim_symbol,
+                          severity="error", detail=str(ex))
                 log_trade_attempt(
                     strategy_setup=s, plan=None,
                     broker_name=_os.getenv("BROKER", "ibkr").strip().lower(),
@@ -311,7 +371,7 @@ def main():
                         help="History pulled each tick (kept short for speed)")
     parser.add_argument("--poll", type=int, default=60, help="Seconds between polls")
     parser.add_argument("--source", default="yfinance",
-                        choices=["auto", "tradovate", "yfinance", "synthetic"])
+                        choices=["auto", "ibkr", "tradovate", "yfinance", "synthetic", "local"])
     parser.add_argument("--htf", default=None)
     parser.add_argument("--no-htf", action="store_true")
     parser.add_argument("--htf-strict", action="store_true")
@@ -336,9 +396,14 @@ def main():
     parser.add_argument("--execute-dry-run", action="store_true",
                         help="Build the order body and log it, but don't send.")
     parser.add_argument("--mode", default=None,
-                        choices=["review", "paper", "live"],
-                        help="review = alert only (no orders); paper = demo; live = real money. "
+                        choices=["review", "paper", "live", "auto_paper_safe"],
+                        help="review = alert only (no orders); paper = demo; live = real money; "
+                             "auto_paper_safe = controlled IBKR paper validation (MES only, qty 1, "
+                             "one position, full execution gate). "
                              "Default: read from personal_rules.yaml (defaults to 'review').")
+    parser.add_argument("--data-override", action="store_true",
+                        help="Permit auto-execution when IBKR live L1 market data is not "
+                             "subscribed (HISTORICAL_ONLY/DELAYED). For plumbing validation only.")
     parser.add_argument("--strategy", default="sweep_choch_fvg",
                         help="Strategy name from signals/strategies/.")
     parser.add_argument("--rules-file", default=None,
@@ -369,6 +434,28 @@ def main():
         log.error("No symbols resolved from %r", args.symbols or args.symbol)
         sys.exit(1)
 
+    # AUTO_PAPER_SAFE hard restriction: MES only — drop anything else up front.
+    if mode == "auto_paper_safe":
+        kept = [(sym, sim) for (sym, sim) in pairs if sim.upper() == "MES"]
+        dropped = [sym for (sym, sim) in pairs if sim.upper() != "MES"]
+        if dropped:
+            log.warning("[AUTO_PAPER_SAFE] dropping non-MES symbols: %s", ", ".join(dropped))
+        pairs = kept or [("ES", "MES")]   # default to MES if nothing valid given
+
+    # Probe IBKR market-data status ONCE for gated modes (paper/auto_paper_safe).
+    # The execution gate refuses to act on stale/unknown data unless --data-override.
+    data_status_by_sym: dict[str, str] = {}
+    if mode in ("paper", "auto_paper_safe") and args.source == "ibkr":
+        from data.ibkr_feed import probe_data_status
+        for _sym, sim_sym in pairs:
+            try:
+                st = probe_data_status(sim_sym)
+            except Exception as e:
+                st = "UNAVAILABLE"
+                log.warning("[%s] market-data probe failed: %s", sim_sym, e)
+            data_status_by_sym[sim_sym] = st
+            log.info("[%s] market-data status = %s", sim_sym, st)
+
     specs: list[WatchSpec] = []
     for sym, sim_sym in pairs:
         if args.reset:
@@ -386,6 +473,9 @@ def main():
             auto_execute=args.auto_execute, equity=args.equity, risk_pct=args.risk_pct,
             allow_live=args.allow_live, execute_dry_run=args.execute_dry_run,
             mode=mode, strategy_name=args.strategy, rules=rules,
+            data_status=data_status_by_sym.get(sim_sym, "UNKNOWN"),
+            data_override=args.data_override,
+            kill_switch_path=rules.kill_switch_path,
         ))
 
     signal.signal(signal.SIGINT, _handle_signal)

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from config import Instrument
@@ -44,10 +44,19 @@ class OpenPosition:
 
 @dataclass
 class AccountSnapshot:
-    account_id: int
+    # account_id is a STRING. Broker account ids are alphanumeric (IBKR paper
+    # accounts look like "DUQ834606"); never coerce to int — doing so silently
+    # mangled DUQ834606 → 0 and broke account routing/matching.
+    account_id: str
     cash: float
     equity: float
     positions: list[OpenPosition]
+    # partial=True means some fields (cash/equity/positions) could not be
+    # loaded in time; `warnings` names what was missing. A partial snapshot is
+    # still usable (it never hangs) — callers decide whether partial is OK.
+    partial: bool = False
+    warnings: list[str] = field(default_factory=list)
+    currency: Optional[str] = None
 
 
 @dataclass
@@ -85,7 +94,7 @@ class BrokerAdapter(ABC):
         entry: float,
         stop: float,
         target: float,
-        account_id: Optional[int] = None,
+        account_id: Optional[str] = None,
         allow_live: bool = False,
         dry_run: bool = False,
     ) -> PlacedOrder: ...
@@ -93,10 +102,10 @@ class BrokerAdapter(ABC):
     # Optional — adapters may override; default raises NotImplementedError so
     # the live position-poller can skip cleanly for adapters that haven't
     # implemented it yet.
-    def snapshot(self, account_id: Optional[int] = None) -> AccountSnapshot:
+    def snapshot(self, account_id: Optional[str] = None) -> AccountSnapshot:
         raise NotImplementedError(f"{self.name} adapter has no snapshot() yet")
 
-    def list_executions(self, account_id: Optional[int] = None,
+    def list_executions(self, account_id: Optional[str] = None,
                         since_ts: Optional[str] = None) -> list[ExecutionEvent]:
         """Return every execution / fill event since ``since_ts`` (ISO UTC).
 
@@ -105,6 +114,14 @@ class BrokerAdapter(ABC):
         """
         raise NotImplementedError(f"{self.name} adapter has no list_executions() yet")
 
+    def list_open_orders(self, account_id: Optional[str] = None) -> list[dict]:
+        """Open / pending (not-yet-terminal) orders for the account.
+
+        Used by the execution gate to refuse a new order while one is already
+        resting. Default returns an empty list; adapters override.
+        """
+        return []
+
     # Higher-level glue used by the live monitor + webhook
     def place_bracket_for_setup(
         self,
@@ -112,7 +129,7 @@ class BrokerAdapter(ABC):
         plan: TradePlan,
         instrument: Instrument,
         *,
-        account_id: Optional[int] = None,
+        account_id: Optional[str] = None,
         allow_live: bool = False,
         dry_run: bool = False,
     ) -> PlacedOrder:
@@ -143,7 +160,7 @@ class DryRunAdapter(BrokerAdapter):
         return PlacedOrder(order_id=0, raw_response={"dry_run": True, "body": body})
 
     def snapshot(self, account_id=None) -> AccountSnapshot:
-        return AccountSnapshot(account_id=account_id or 0, cash=0.0, equity=0.0, positions=[])
+        return AccountSnapshot(account_id=str(account_id) if account_id else "", cash=0.0, equity=0.0, positions=[])
 
     def list_executions(self, account_id=None, since_ts=None) -> list[ExecutionEvent]:
         return []

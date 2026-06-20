@@ -28,6 +28,15 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 SIGNALS_LOG = STATE_DIR / "live_signals.jsonl"
 SKIPPED_LOG = STATE_DIR / "skipped_setups.jsonl"
 TRADES_LOG = STATE_DIR / "live_trades.jsonl"
+EVENTS_LOG = STATE_DIR / "events.jsonl"
+
+# Phase 5 observability taxonomy. Every meaningful state change is one event row
+# in events.jsonl, tagged with a category + event name so the go/no-go reader
+# can count fills, rejects, disconnects, kill-switch halts, etc.
+EV_SIGNAL = "signal"        # detected | rejected | executed
+EV_ORDER = "order"          # submitted | accepted | cancelled | rejected
+EV_EXECUTION = "execution"  # fill | partial_fill | stop_hit | target_hit
+EV_SYSTEM = "system"        # disconnect | reconnect | snapshot_timeout | data_failure | kill_switch | gate_block
 
 
 def _now_iso() -> str:
@@ -175,6 +184,36 @@ def log_trade_attempt(
     }
     _append(TRADES_LOG, row)
     return row
+
+
+# ---------------------------------------------------------------------------
+# Event log — Phase 5 observability. One append-only row per state change.
+# ---------------------------------------------------------------------------
+def log_event(
+    category: str,                     # EV_SIGNAL | EV_ORDER | EV_EXECUTION | EV_SYSTEM
+    event: str,                        # e.g. "detected", "submitted", "fill", "disconnect"
+    *,
+    symbol: Optional[str] = None,
+    detail: Optional[str] = None,
+    severity: str = "info",            # info | warning | error
+    **fields: Any,
+) -> dict:
+    """Append one structured event row to events.jsonl. Never raises."""
+    row = {
+        "ts_logged": _now_iso(),
+        "category": category,
+        "event": event,
+        "symbol": symbol,
+        "severity": severity,
+        "detail": detail,
+        **fields,
+    }
+    _append(EVENTS_LOG, row)
+    return row
+
+
+def load_events() -> list[dict]:
+    return _load(EVENTS_LOG)
 
 
 # ---------------------------------------------------------------------------

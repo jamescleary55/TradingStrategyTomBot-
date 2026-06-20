@@ -107,32 +107,25 @@ def get_bars(symbol: str, timeframe: str, days: int = 30) -> pd.DataFrame:
     start_ts = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(days=days)
     end_ts = pd.Timestamp.utcnow().tz_localize(None)
 
+    # IBKR forbids endDateTime on a continuous future (Error 10339), so we make
+    # one request with endDateTime="" and a duration covering `days`. Currency is
+    # passed explicitly to avoid ambiguous-contract qualification.
+    duration = f"{days} D" if days <= 365 else f"{(days // 365) + 1} Y"
+
     ib, lib = _connect()
     try:
-        contract = lib.ContFuture(sym, exch)          # continuous front-month
+        contract = lib.ContFuture(sym, exch, "USD")   # continuous front-month
         ib.qualifyContracts(contract)
-
-        frames: list[pd.DataFrame] = []
-        cursor = end_ts
-        while cursor > start_ts:
-            bars = ib.reqHistoricalData(
-                contract,
-                endDateTime=cursor.strftime("%Y%m%d %H:%M:%S"),
-                durationStr=chunk,
-                barSizeSetting=bar_size,
-                whatToShow="TRADES",
-                useRTH=False,
-                formatDate=1,
-            )
-            if not bars:
-                break
-            df = lib.util.df(bars)
-            frames.append(df)
-            earliest = pd.Timestamp(df["date"].iloc[0])
-            if earliest <= start_ts or earliest >= cursor:
-                break
-            cursor = earliest
-            time.sleep(0.4)                            # respect IBKR pacing limits
+        bars = ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow="TRADES",
+            useRTH=False,
+            formatDate=1,
+        )
+        frames: list[pd.DataFrame] = [lib.util.df(bars)] if bars else []
     finally:
         ib.disconnect()
 
@@ -149,6 +142,79 @@ def get_bars(symbol: str, timeframe: str, days: int = 30) -> pd.DataFrame:
     out = out[(out.index >= start_ts.tz_localize("UTC")) &
               (out.index <= end_ts.tz_localize("UTC"))]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Market-data status — never let historical/delayed masquerade as live.
+# ---------------------------------------------------------------------------
+DATA_LIVE = "LIVE"
+DATA_DELAYED = "DELAYED"
+DATA_HISTORICAL_ONLY = "HISTORICAL_ONLY"
+DATA_UNAVAILABLE = "UNAVAILABLE"
+
+
+def classify_data_status(has_live_quote: bool, has_delayed_quote: bool,
+                         has_historical: bool, error_354: bool = False) -> str:
+    """Pure classifier (testable). Live > delayed > historical-only > none.
+
+    `error_354` (IBKR "market data not subscribed") is informational; the
+    decision is driven by what data actually arrived.
+    """
+    if has_live_quote:
+        return DATA_LIVE
+    if has_delayed_quote:
+        return DATA_DELAYED
+    if has_historical:
+        return DATA_HISTORICAL_ONLY
+    return DATA_UNAVAILABLE
+
+
+def probe_data_status(symbol: str, *, client_id: int = 71) -> str:
+    """Connect and determine the live market-data status for a futures root.
+
+    Returns one of DATA_LIVE / DATA_DELAYED / DATA_HISTORICAL_ONLY / DATA_UNAVAILABLE.
+    Used by the execution gate: automated orders require DATA_LIVE (or an explicit
+    operator override).
+    """
+    import math
+    lib = _ib_lib()
+    sym = symbol.upper()
+    exch = IB_EXCHANGE.get(sym)
+    if exch is None:
+        return DATA_UNAVAILABLE
+    ib = lib.IB()
+    err354 = {"hit": False}
+    ib.errorEvent += lambda reqId, code, msg, c=None: err354.__setitem__("hit", err354["hit"] or code == 354)
+    ib.connect(IB_HOST, IB_PORT, clientId=client_id, timeout=15)
+    try:
+        contract = lib.ContFuture(sym, exch, "USD")
+        ib.qualifyContracts(contract)
+
+        def _has_quote():
+            t = ib.reqMktData(contract, "", True, False)
+            ib.sleep(3)
+            vals = [t.bid, t.ask, t.last]
+            return any(v is not None and not (isinstance(v, float) and math.isnan(v)) for v in vals)
+
+        ib.reqMarketDataType(1)            # real-time
+        has_live = _has_quote()
+        has_delayed = False
+        if not has_live:
+            ib.reqMarketDataType(3)        # delayed
+            has_delayed = _has_quote()
+
+        has_hist = False
+        try:
+            bars = ib.reqHistoricalData(contract, endDateTime="", durationStr="1 D",
+                                        barSizeSetting="5 mins", whatToShow="TRADES",
+                                        useRTH=False, formatDate=1)
+            has_hist = bool(bars)
+        except Exception:
+            has_hist = False
+
+        return classify_data_status(has_live, has_delayed, has_hist, err354["hit"])
+    finally:
+        ib.disconnect()
 
 
 if __name__ == "__main__":

@@ -254,7 +254,9 @@ class TradovateAdapter(BrokerAdapter):
                 raw=p,
             ))
         equity = cash + sum((p.unrealised_pnl or 0) for p in positions)
-        return AccountSnapshot(account_id=account_id, cash=cash,
+        # account_id is a string in AccountSnapshot; Tradovate's native id is
+        # numeric, so stringify it at the boundary (no coercion of broker ids).
+        return AccountSnapshot(account_id=str(account_id), cash=cash,
                                equity=equity, positions=positions)
 
     def list_executions(self, account_id=None, since_ts=None) -> list[ExecutionEvent]:

@@ -194,7 +194,9 @@ class TopstepXAdapter(BrokerAdapter):
                 raw=p,
             ))
         equity = cash + sum(p.unrealised_pnl or 0 for p in positions)
-        return AccountSnapshot(account_id=aid, cash=cash,
+        # account_id is a string in AccountSnapshot; ProjectX/TopstepX's native
+        # id is numeric, so stringify it at the boundary (no coercion of ids).
+        return AccountSnapshot(account_id=str(aid), cash=cash,
                                equity=equity, positions=positions)
 
     def list_executions(self, account_id: Optional[int] = None,

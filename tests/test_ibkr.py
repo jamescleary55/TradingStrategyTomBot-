@@ -38,9 +38,10 @@ class _OrderStatus:
 
 
 class _Trade:
-    def __init__(self, order, status):
+    def __init__(self, order, status, contract=None):
         self.order = order
         self.orderStatus = _OrderStatus(status)
+        self.contract = contract or types.SimpleNamespace(localSymbol="MESU6", symbol="MES")
 
 
 class _FakeIB:
@@ -72,6 +73,46 @@ class _FakeIB:
     def placeOrder(self, contract, order):
         return _Trade(order, "PreSubmitted")
 
+    # --- account snapshot (timeout-bounded async path) ---
+    # account id is intentionally alphanumeric to prove no int coercion happens.
+    managed_accounts = ["DUQ834606"]
+    snapshot_positions: list = []
+
+    def managedAccounts(self):
+        return list(self.managed_accounts)
+
+    async def accountSummaryAsync(self, acct):
+        return [
+            types.SimpleNamespace(tag="TotalCashValue", value="1000000.0", currency="EUR"),
+            types.SimpleNamespace(tag="NetLiquidation", value="1000000.0", currency="EUR"),
+        ]
+
+    async def reqPositionsAsync(self):
+        return list(self.snapshot_positions)
+
+    def run(self, coro):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    # --- open orders / flatten ---
+    open_trades_list: list = []
+
+    def reqAllOpenOrders(self):
+        return list(self.open_trades_list)
+
+    def openTrades(self):
+        return list(self.open_trades_list)
+
+    def reqGlobalCancel(self):
+        self.global_cancelled = True
+
+    def cancelOrder(self, order):
+        self.cancelled = getattr(self, "cancelled", []) + [getattr(order, "orderId", None)]
+
     # --- historical data ---
     def reqHistoricalData(self, contract, **kwargs):
         self._hist_calls += 1
@@ -91,8 +132,8 @@ class _FakeIB:
 def _make_fake_lib():
     mod = types.ModuleType("ib_async")
     mod.IB = _FakeIB
-    mod.ContFuture = lambda sym, exch: types.SimpleNamespace(
-        symbol=sym, exchange=exch, localSymbol=f"{sym}Z6")
+    mod.ContFuture = lambda sym, exch, currency="USD": types.SimpleNamespace(
+        symbol=sym, exchange=exch, currency=currency, localSymbol=f"{sym}Z6")
     mod.util = types.SimpleNamespace(df=lambda bars: pd.DataFrame(bars))
     return mod
 
@@ -185,6 +226,79 @@ def test_place_bracket_sell_maps_to_sell_action(fake_ib):
     IBKRAdapter().place_bracket(instrument=MNQ, side="Sell", qty=1,
                                 entry=100.0, stop=101.0, target=98.0)
     assert _FakeIB.last_bracket["action"] == "SELL"
+
+
+# ---------------------------------------------------------------------------
+# account_id is a STRING and survives verbatim — regression for the DUQ834606→0
+# coercion bug. The snapshot must never numerically convert the account id.
+# ---------------------------------------------------------------------------
+def test_snapshot_preserves_alphanumeric_account_id(fake_ib):
+    _FakeIB.snapshot_positions = []
+    snap = IBKRAdapter().snapshot()
+    assert snap.account_id == "DUQ834606"        # exact, unchanged
+    assert isinstance(snap.account_id, str)      # never coerced to int
+    assert snap.account_id != 0 and snap.account_id != "0"
+    assert snap.partial is False
+    assert snap.cash == 1_000_000.0
+    assert snap.currency == "EUR"
+
+
+def test_snapshot_account_id_is_string_type_in_dataclass():
+    """The dataclass contract itself: account_id stays exactly what we pass."""
+    from execution.base import AccountSnapshot
+    snap = AccountSnapshot(account_id="DUQ834606", cash=0.0, equity=0.0, positions=[])
+    assert snap.account_id == "DUQ834606"
+    assert isinstance(snap.account_id, str)
+
+
+def test_snapshot_position_account_filter_uses_string(fake_ib):
+    """Position account-matching compares as strings (no int() on DUQ834606)."""
+    _FakeIB.snapshot_positions = [
+        types.SimpleNamespace(
+            account="DUQ834606", position=1.0, avgCost=6800.0,
+            contract=types.SimpleNamespace(localSymbol="MESU6", symbol="MES")),
+    ]
+    snap = IBKRAdapter().snapshot(account_id="DUQ834606")
+    assert len(snap.positions) == 1
+    assert snap.positions[0].symbol == "MESU6"
+    _FakeIB.snapshot_positions = []   # reset shared fake state
+
+
+# ---------------------------------------------------------------------------
+# list_open_orders excludes terminal statuses
+# ---------------------------------------------------------------------------
+def test_list_open_orders_excludes_terminal(fake_ib):
+    _FakeIB.open_trades_list = [
+        _Trade(_Order(11), "PreSubmitted"),
+        _Trade(_Order(12), "Submitted"),
+        _Trade(_Order(13), "Filled"),       # terminal — excluded
+        _Trade(_Order(14), "Cancelled"),    # terminal — excluded
+    ]
+    out = IBKRAdapter().list_open_orders()
+    ids = {o["orderId"] for o in out}
+    assert ids == {11, 12}
+    _FakeIB.open_trades_list = []
+
+
+# ---------------------------------------------------------------------------
+# flatten_and_cancel_all DRY RUN sends nothing but reports the plan
+# ---------------------------------------------------------------------------
+def test_flatten_dry_run_reports_without_sending(fake_ib):
+    _FakeIB.open_trades_list = [_Trade(_Order(21), "Submitted")]
+    _FakeIB.snapshot_positions = [
+        types.SimpleNamespace(
+            account="DUQ834606", position=2.0, avgCost=6800.0,
+            contract=types.SimpleNamespace(localSymbol="MESU6", symbol="MES")),
+    ]
+    report = IBKRAdapter().flatten_and_cancel_all(dry_run=True)
+    assert report["dry_run"] is True
+    assert len(report["cancelled_orders"]) == 1
+    assert len(report["closed_positions"]) == 1
+    # A long 2-lot is closed by SELLing 2.
+    assert report["closed_positions"][0]["close_action"] == "SELL"
+    assert report["closed_positions"][0]["qty"] == 2
+    _FakeIB.open_trades_list = []
+    _FakeIB.snapshot_positions = []
 
 
 # ---------------------------------------------------------------------------

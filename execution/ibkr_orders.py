@@ -23,6 +23,7 @@ Connection comes from .env (config.py): IB_HOST, IB_PORT, IB_CLIENT_ID.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -66,6 +67,15 @@ def _connect():
             f"(clientId={IB_CLIENT_ID}). Is it running with the API enabled? {e}"
         ) from e
     return ib, lib
+
+
+def _run_bounded(ib, coro_factory, seconds: float):
+    """Run an ib_insync async call on the IB event loop, bounded by `seconds`.
+
+    Raises ``asyncio.TimeoutError`` if it doesn't complete in time, so callers
+    can degrade to a partial result instead of blocking forever.
+    """
+    return ib.run(asyncio.wait_for(coro_factory(), seconds))
 
 
 def _qualify_future(ib, lib, symbol: str):
@@ -150,40 +160,71 @@ class IBKRAdapter(BrokerAdapter):
         finally:
             ib.disconnect()
 
-    def snapshot(self, account_id=None) -> AccountSnapshot:
+    def snapshot(self, account_id=None, timeout: float = 8.0) -> AccountSnapshot:
+        """Timeout-bounded account snapshot — never hangs.
+
+        Uses one-shot, timeout-bounded async requests instead of the streaming
+        ``reqAccountUpdates`` (which could wait indefinitely). If account values
+        or positions don't arrive within ``timeout`` seconds, returns a PARTIAL
+        snapshot (``partial=True``, with ``warnings`` naming the missing fields)
+        rather than blocking the monitor/runner forever.
+        """
         ib, lib = _connect()
+        warnings: list[str] = []
+        cash = equity = None
+        currency = None
+        positions: list[OpenPosition] = []
         try:
-            ib.reqAccountUpdates()
-            ib.sleep(1)
             accounts = ib.managedAccounts()
             acct = str(account_id) if account_id is not None else (accounts[0] if accounts else "")
 
-            cash = 0.0
-            equity = 0.0
-            for v in ib.accountValues(acct):
-                if v.currency not in ("USD", "BASE", ""):
-                    continue
-                if v.tag == "TotalCashValue":
-                    cash = float(v.value)
-                elif v.tag == "NetLiquidation":
-                    equity = float(v.value)
+            # Account values (base currency; do NOT filter to USD — paper accts
+            # are often EUR, and these tags are reported in the account's base ccy).
+            try:
+                rows = _run_bounded(ib, lambda: ib.accountSummaryAsync(acct), timeout)
+                for v in rows:
+                    if v.tag == "TotalCashValue":
+                        cash = float(v.value); currency = v.currency or currency
+                    elif v.tag == "NetLiquidation":
+                        equity = float(v.value); currency = v.currency or currency
+            except Exception as e:
+                warnings.append(f"account values unavailable ({e.__class__.__name__})")
+                log.warning("IBKR snapshot: account values timed out/failed: %s", e)
 
-            positions: list[OpenPosition] = []
-            for p in ib.positions(acct):
-                if p.position == 0:
-                    continue
-                qty = int(p.position)
-                positions.append(OpenPosition(
-                    symbol=getattr(p.contract, "localSymbol", "") or getattr(p.contract, "symbol", ""),
-                    side="Buy" if qty > 0 else "Sell",
-                    qty=abs(qty),
-                    avg_entry=float(p.avgCost or 0.0),
-                    unrealised_pnl=None,
-                    raw=p,
-                ))
+            # Positions (timeout-bounded).
+            try:
+                pos = _run_bounded(ib, lambda: ib.reqPositionsAsync(), timeout) or []
+                for p in pos:
+                    if account_id is not None and str(getattr(p, "account", acct)) != str(account_id):
+                        continue
+                    if p.position == 0:
+                        continue
+                    qty = int(p.position)
+                    positions.append(OpenPosition(
+                        symbol=getattr(p.contract, "localSymbol", "") or getattr(p.contract, "symbol", ""),
+                        side="Buy" if qty > 0 else "Sell",
+                        qty=abs(qty),
+                        avg_entry=float(p.avgCost or 0.0),
+                        unrealised_pnl=None,
+                        raw=p,
+                    ))
+                positions_ok = True
+            except Exception as e:
+                positions_ok = False
+                warnings.append(f"positions unavailable ({e.__class__.__name__})")
+                log.warning("IBKR snapshot: positions timed out/failed: %s", e)
+
+            partial = bool(warnings)
             return AccountSnapshot(
-                account_id=_safe_int(acct), cash=cash,
-                equity=equity or cash, positions=positions,
+                # Keep the raw alphanumeric account id (e.g. "DUQ834606") — never
+                # coerce to int; that silently produced 0 and broke routing.
+                account_id=str(acct),
+                cash=cash if cash is not None else 0.0,
+                equity=(equity if equity is not None else (cash or 0.0)),
+                positions=positions,
+                partial=partial,
+                warnings=warnings,
+                currency=currency,
             )
         finally:
             ib.disconnect()
@@ -227,9 +268,130 @@ class IBKRAdapter(BrokerAdapter):
         finally:
             ib.disconnect()
 
+    def flatten_and_cancel_all(self, account_id=None, dry_run=False) -> dict:
+        """EMERGENCY: cancel every open order and close every position to flat.
 
-def _safe_int(v) -> int:
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return 0
+        Steps, each logged into the returned report:
+          1. Cancel all open orders (global cancel).
+          2. Submit an offsetting MARKET order per open position.
+          3. Re-snapshot and verify the account is flat (no positions, no orders).
+
+        ``dry_run=True`` reports what WOULD happen without sending anything. This
+        is never invoked automatically — only via scripts/flatten_account.py by
+        an operator.
+        """
+        report: dict = {
+            "dry_run": dry_run, "cancelled_orders": [], "closed_positions": [],
+            "errors": [], "flat": False, "account_id": None,
+        }
+        ib, lib = _connect()
+        try:
+            accounts = ib.managedAccounts()
+            acct = str(account_id) if account_id is not None else (accounts[0] if accounts else "")
+            report["account_id"] = acct
+
+            # 1. Cancel all open orders.
+            open_before = []
+            try:
+                ib.reqAllOpenOrders()
+                ib.sleep(0.5)
+                open_before = list(ib.openTrades())
+            except Exception as e:
+                report["errors"].append(f"list open orders failed: {e}")
+            for t in open_before:
+                oid = getattr(t.order, "orderId", None)
+                status = getattr(t.orderStatus, "status", "")
+                if status in ("Filled", "Cancelled", "ApiCancelled", "Inactive"):
+                    continue
+                report["cancelled_orders"].append({"orderId": oid, "status_before": status})
+                if not dry_run:
+                    try:
+                        ib.cancelOrder(t.order)
+                    except Exception as e:
+                        report["errors"].append(f"cancel {oid} failed: {e}")
+            if not dry_run and report["cancelled_orders"]:
+                try:
+                    ib.reqGlobalCancel()   # belt-and-suspenders
+                except Exception as e:
+                    report["errors"].append(f"global cancel failed: {e}")
+                ib.sleep(1)
+
+            # 2. Close each open position with an offsetting market order.
+            try:
+                positions = _run_bounded(ib, lambda: ib.reqPositionsAsync(), 8.0) or []
+            except Exception as e:
+                positions = []
+                report["errors"].append(f"list positions failed: {e}")
+            for p in positions:
+                if account_id is not None and str(getattr(p, "account", acct)) != str(account_id):
+                    continue
+                qty = int(p.position)
+                if qty == 0:
+                    continue
+                sym = getattr(p.contract, "localSymbol", "") or getattr(p.contract, "symbol", "")
+                close_action = "SELL" if qty > 0 else "BUY"
+                report["closed_positions"].append(
+                    {"symbol": sym, "position": qty, "close_action": close_action, "qty": abs(qty)})
+                if not dry_run:
+                    try:
+                        order = lib.MarketOrder(close_action, abs(qty))
+                        order.account = acct or order.account
+                        ib.placeOrder(p.contract, order)
+                    except Exception as e:
+                        report["errors"].append(f"close {sym} failed: {e}")
+            if not dry_run and report["closed_positions"]:
+                ib.sleep(2)   # let market orders fill
+
+            # 3. Verify flat.
+            if dry_run:
+                report["flat"] = not report["closed_positions"] and not report["cancelled_orders"]
+            else:
+                try:
+                    pos_after = _run_bounded(ib, lambda: ib.reqPositionsAsync(), 8.0) or []
+                    live_pos = [p for p in pos_after if int(p.position) != 0 and (
+                        account_id is None or str(getattr(p, "account", acct)) == str(account_id))]
+                    ib.reqAllOpenOrders(); ib.sleep(0.5)
+                    live_ord = [t for t in ib.openTrades()
+                                if getattr(t.orderStatus, "status", "") not in
+                                ("Filled", "Cancelled", "ApiCancelled", "Inactive")]
+                    report["flat"] = not live_pos and not live_ord
+                    report["positions_remaining"] = len(live_pos)
+                    report["orders_remaining"] = len(live_ord)
+                except Exception as e:
+                    report["errors"].append(f"verify flat failed: {e}")
+            log.warning("flatten_and_cancel_all (dry_run=%s): cancelled=%d closed=%d flat=%s errors=%d",
+                        dry_run, len(report["cancelled_orders"]),
+                        len(report["closed_positions"]), report["flat"], len(report["errors"]))
+            return report
+        finally:
+            ib.disconnect()
+
+    def list_open_orders(self, account_id=None) -> list[dict]:
+        """Open / pending IBKR orders (non-terminal) for the account.
+
+        Terminal statuses (Filled/Cancelled/ApiCancelled/Inactive) are excluded
+        so the execution gate only sees genuinely resting orders.
+        """
+        ib, lib = _connect()
+        _TERMINAL = {"Filled", "Cancelled", "ApiCancelled", "Inactive"}
+        try:
+            ib.reqAllOpenOrders()
+            ib.sleep(0.5)
+            out: list[dict] = []
+            for t in ib.openTrades():
+                acct = getattr(t.order, "account", "") or ""
+                if account_id is not None and str(acct) and str(acct) != str(account_id):
+                    continue
+                status = getattr(t.orderStatus, "status", "") or ""
+                if status in _TERMINAL:
+                    continue
+                out.append({
+                    "orderId": getattr(t.order, "orderId", None),
+                    "status": status,
+                    "symbol": getattr(t.contract, "localSymbol", "")
+                              or getattr(t.contract, "symbol", ""),
+                    "account": str(acct),
+                })
+            return out
+        finally:
+            ib.disconnect()
