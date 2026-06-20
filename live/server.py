@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config as cfg
 from execution.base import ExecutionEvent, get_adapter
+from live import ops_health as oh
 from live.forward_log import load_events, load_signals, load_skipped, load_trades
 from live.tracker import _load_alerts, _resolve_one
 from live.webhook import RUNTIME as WEBHOOK_RUNTIME, webhook as webhook_view, health as webhook_health
@@ -52,6 +53,10 @@ ALERT_LOG = STATE_DIR / "alerts.jsonl"
 POSITIONS_LOG = STATE_DIR / "positions.jsonl"
 EXECS_LOG = STATE_DIR / "live_executions.jsonl"
 RUNTIME_FILE = STATE_DIR / "monitor-runtime.json"
+HEARTBEAT_FILE = STATE_DIR / "monitor-heartbeat.txt"
+
+# Server-side latch: critical alarms stay visible until the operator clears them.
+_ALARM_LATCH: dict = {}
 
 _EVENT_FIELDS = set(ExecutionEvent.__dataclass_fields__.keys())
 _OPS_CACHE: dict = {"ts": 0.0, "data": None}
@@ -129,6 +134,33 @@ def _reconcile_state():
     return execs, trades, metrics
 
 
+def _reconcile_safe():
+    """Like _reconcile_state but never raises; returns (execs, trades, metrics, error)."""
+    try:
+        execs, trades, metrics = _reconcile_state()
+        return execs, trades, metrics, None
+    except Exception as e:
+        log.exception("reconciliation failed")
+        return [], [], compute_metrics([]), f"{type(e).__name__}: {e}"
+
+
+def _raw_fill_count() -> int:
+    return sum(1 for r in _load_jsonl(EXECS_LOG)
+               if (r.get("kind") or "fill") in ("fill", "partial"))
+
+
+def _read_heartbeat() -> str | None:
+    try:
+        return HEARTBEAT_FILE.read_text().strip() or None
+    except Exception:
+        return None
+
+
+def _last_event_ts(events: list) -> str | None:
+    ts = [e.get("ts_logged") for e in events if e.get("ts_logged")]
+    return max(ts) if ts else None
+
+
 def _read_runtime() -> dict | None:
     if not RUNTIME_FILE.exists():
         return None
@@ -160,7 +192,8 @@ def _broker_ops() -> dict:
         return _OPS_CACHE["data"]
     data = {"ok": False, "account_id": None, "paper": None, "cash": None,
             "equity": None, "currency": None, "positions": [], "open_orders": [],
-            "error": None, "source": "broker", "stale_ts": None}
+            "error": None, "source": "broker", "stale_ts": None,
+            "read_ts": dt.datetime.now(dt.timezone.utc).isoformat()}
     try:
         a = get_adapter("ibkr")
         snap = a.snapshot()
@@ -250,27 +283,70 @@ def api_reconciliation():
 
 @app.route("/api/ops", methods=["GET"])
 def api_ops():
-    """Operational state for supervised runs (Phase 2)."""
+    """Hardened operational state + failure detection for supervised runs."""
+    global _ALARM_LATCH
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+
     broker = _broker_ops()
-    runtime = _read_runtime()
-    ks_path = (runtime or {}).get("kill_switch_path") or "~/.ict-bot/KILL_SWITCH"
+    runtime = _read_runtime() or {}
+    ks_path = runtime.get("kill_switch_path") or "~/.ict-bot/KILL_SWITCH"
     kstate = ks.check(ks_path)
+    kill_switch = {"present": kstate.present, "path": kstate.path}
 
-    _execs, trades, metrics = _reconcile_state()
-    n_open = sum(1 for t in trades if t.status in (OPEN, PARTIAL))
-
+    _execs, trades, metrics, recon_err = _reconcile_safe()
     events = load_events()
-    gate_blocks = [e for e in events if e.get("event") == "gate_block"][-6:]
+    trades_log = load_trades()
+    monitor_running = _pid_alive(runtime.get("pid"))
 
-    monitor_running = _pid_alive((runtime or {}).get("pid"))
     positions = broker.get("positions", [])
     pending = broker.get("open_orders", [])
     flat = bool(broker.get("ok")) and len(positions) == 0
+    n_open = sum(1 for t in trades if t.status in (OPEN, PARTIAL))
 
-    # The 7 acceptance questions, answered.
+    # --- Phase 1: freshness ---
+    fresh = oh.freshness(now_iso, broker_ts=broker.get("read_ts"),
+                         event_ts=_last_event_ts(events),
+                         heartbeat_ts=_read_heartbeat(),
+                         monitor_running=monitor_running)
+
+    # --- Phase 2: position mismatch ---
+    bot_pos = oh.bot_open_positions(trades)
+    mismatch = oh.position_mismatch(positions, bot_pos)
+
+    # --- Phase 3: execution safety alarms ---
+    safety = oh.execution_safety_alarms(
+        broker=broker, kill_switch=kill_switch, runtime=runtime,
+        trades_log=trades_log, events=events, now_iso=now_iso)
+
+    # --- Phase 4: reconciliation health ---
+    recon_health = oh.reconciliation_health(
+        trades=trades, metrics=metrics, raw_fill_count=_raw_fill_count(),
+        reconcile_error=recon_err)
+
+    # --- Phase 5: daily risk ---
+    try:
+        from risk.rules import load as load_rules
+        _rules = load_rules()
+        caps = dict(max_daily_loss_R=_rules.max_daily_loss_R,
+                    max_trades_per_day=_rules.max_trades_per_day,
+                    open_risk_R_cap=float(_rules.max_open_positions))
+    except Exception:
+        caps = dict(max_daily_loss_R=None, max_trades_per_day=None, open_risk_R_cap=None)
+    risk = oh.daily_risk(trades=trades, now_iso=now_iso, **caps)
+
+    # --- combine alarms + latch criticals ---
+    all_alarms = mismatch + safety + risk["alarms"]
+    _ALARM_LATCH = oh.merge_latch(_ALARM_LATCH, all_alarms, now_iso)
+    latched = sorted(_ALARM_LATCH.values(),
+                     key=lambda a: (not a.get("active"), a.get("first_seen", "")))
+
+    # --- Phase 6: supervision verdict ---
+    supervision = oh.supervision(alarms=all_alarms, fresh=fresh,
+                                 broker=broker, kill_switch=kill_switch)
+
+    gate_blocks = [e for e in events if e.get("event") == "gate_block"][-6:]
     answers = {
-        "safe_to_supervise": (not kstate.present) and bool(broker.get("ok"))
-                              and bool(broker.get("paper")),
+        "safe_to_supervise": supervision["safe"],
         "paper_only": broker.get("paper"),
         "flat_or_position": "flat" if flat else (f"{len(positions)} position(s)"
                                                  if broker.get("ok") else "unknown"),
@@ -280,14 +356,21 @@ def api_ops():
     }
 
     return jsonify({
+        "now": now_iso,
+        "supervision": supervision,
+        "freshness": fresh,
+        "alarms": all_alarms,
+        "latched_critical": latched,
+        "position_mismatch": mismatch,
+        "reconciliation_health": recon_health,
+        "daily_risk": risk,
         "broker": broker,
-        "kill_switch": {"present": kstate.present, "path": kstate.path},
-        "monitor": {"running": monitor_running,
-                    "mode": (runtime or {}).get("mode"),
-                    "auto_execute": (runtime or {}).get("auto_execute"),
-                    "symbols": (runtime or {}).get("symbols"),
-                    "data_status": (runtime or {}).get("data_status"),
-                    "started_at": (runtime or {}).get("started_at")},
+        "kill_switch": kill_switch,
+        "monitor": {"running": monitor_running, "mode": runtime.get("mode"),
+                    "auto_execute": runtime.get("auto_execute"),
+                    "symbols": runtime.get("symbols"),
+                    "data_status": runtime.get("data_status"),
+                    "started_at": runtime.get("started_at")},
         "reconciliation": {"closed": metrics["n_closed"], "open_or_partial": n_open},
         "pending_orders": pending,
         "positions": positions,
@@ -297,6 +380,15 @@ def api_ops():
         "flatten_reminder": "Halt: touch ~/.ict-bot/KILL_SWITCH  ·  "
                             "Flatten: python scripts/flatten_account.py --execute",
     })
+
+
+@app.route("/api/ops/clear", methods=["POST"])
+def api_ops_clear():
+    """Operator dismiss of latched critical alarms (re-latches if still active)."""
+    global _ALARM_LATCH
+    n = len(_ALARM_LATCH)
+    _ALARM_LATCH = {}
+    return jsonify({"cleared": n})
 
 
 @app.route("/api/positions", methods=["GET"])
@@ -419,6 +511,26 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .kv .v { font-variant-numeric: tabular-nums; font-weight:600; }
   code { background: var(--panel-2); padding:1px 6px; border-radius:5px;
     font-size:12px; color: var(--cyan); }
+  .banner { display:flex; align-items:center; gap:14px; padding:14px 18px;
+    border-radius: 13px; margin-bottom: 14px; border:1px solid var(--border); font-weight:600; }
+  .banner .big { font-size: 17px; font-weight: 800; letter-spacing:-0.01em; }
+  .banner.ok { background: var(--green-soft); border-color: rgba(34,197,94,0.4); color: var(--green); }
+  .banner.bad { background: var(--red-soft); border-color: rgba(248,113,113,0.5); color: var(--red);
+    animation: pulseRed 1.6s infinite; }
+  @keyframes pulseRed { 0%,100% { border-color: rgba(248,113,113,0.5); } 50% { border-color: rgba(248,113,113,1); } }
+  .banner .reasons { color: var(--text-dim); font-weight:500; font-size:12.5px; }
+  .crit-banner { background: var(--red-soft); border:1px solid var(--red);
+    border-radius: 13px; padding: 14px 18px; margin-bottom:14px; }
+  .crit-banner h3 { margin:0 0 8px; color: var(--red); font-size: 13px;
+    text-transform:uppercase; letter-spacing:0.5px; display:flex; justify-content:space-between; }
+  .crit-banner .item { padding:6px 0; border-top:1px solid rgba(248,113,113,0.2); font-size:13px; }
+  .crit-banner .item.resolved { opacity:0.55; }
+  .crit-banner button { background:var(--red); color:#1a0606; border:none; border-radius:7px;
+    padding:4px 12px; font-weight:700; cursor:pointer; font-size:11px; font-family:inherit; }
+  .lvl-GREEN { color: var(--green); } .lvl-YELLOW { color: var(--yellow); } .lvl-RED { color: var(--red); }
+  .chip.lvl-GREEN { border-color: rgba(34,197,94,0.4); background: var(--green-soft); color: var(--green); }
+  .chip.lvl-YELLOW { border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.12); color: var(--yellow); }
+  .chip.lvl-RED { border-color: rgba(248,113,113,0.45); background: var(--red-soft); color: var(--red); }
 </style>
 </head>
 <body>
@@ -439,6 +551,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </nav>
   </aside>
   <main class="main">
+    <div id="supervision_banner"></div>
+    <div id="critical_banner"></div>
     <header class="topbar">
       <h1 id="page_title">Now</h1>
       <div class="sub" id="page_subtitle">snapshot of the bot's live state</div>
@@ -455,9 +569,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
     <section class="section" data-panel="ops">
       <div id="ops_answers" class="safety-strip"></div>
+      <div class="card" style="margin-top:14px;"><h2>Data freshness</h2><div class="safety-strip" id="ops_freshness"></div></div>
       <div class="grid cols-2" style="margin-top:14px;">
         <div class="card"><h2>Connection &amp; account</h2><div id="ops_account"></div></div>
         <div class="card"><h2>Run state</h2><div id="ops_run"></div></div>
+      </div>
+      <div class="grid cols-2" style="margin-top:14px;">
+        <div class="card"><h2>Reconciliation health <span id="ops_recon_lvl"></span></h2><div id="ops_recon"></div></div>
+        <div class="card"><h2>Daily risk monitor</h2><div id="ops_risk"></div></div>
       </div>
       <div class="grid cols-2" style="margin-top:14px;">
         <div class="card"><h2>Pending orders</h2><div id="ops_orders"></div></div>
@@ -724,6 +843,74 @@ function opsGateHtml(o) {
     `<span class="v" style="color:var(--yellow);font-weight:500;text-align:right;max-width:70%">${e.detail || e.event}</span></div>`).join('');
 }
 
+// ---- hardening: supervision banner, critical banner, freshness, health, risk ----
+function supervisionBannerHtml(o) {
+  const s = o.supervision;
+  if (s.safe) {
+    return `<div class="banner ok"><span class="big">✓ SAFE TO SUPERVISE</span>
+      <span class="reasons">all execution-safety checks pass · ${o.reconciliation.closed} closed trade(s)</span></div>`;
+  }
+  const reasons = (s.reasons || []).map(r => `• ${r}`).join('&nbsp;&nbsp; ');
+  return `<div class="banner bad"><span class="big">✗ OPERATOR ATTENTION REQUIRED</span>
+    <span class="reasons">${reasons || 'see alarms below'}</span></div>`;
+}
+function criticalBannerHtml(o) {
+  const lat = o.latched_critical || [];
+  if (!lat.length) return '';
+  const items = lat.map(a => `<div class="item ${a.active ? '' : 'resolved'}">
+    <strong>${a.title}</strong> — ${a.detail} ${a.active ? '' : '<span class="dim">(resolved — dismiss to clear)</span>'}</div>`).join('');
+  return `<div class="crit-banner">
+    <h3><span>⛔ ${lat.length} CRITICAL ALARM(S) — visible until cleared</span>
+      <button onclick="clearAlarms()">Clear</button></h3>${items}</div>`;
+}
+async function clearAlarms() {
+  try { await fetch('/api/ops/clear', {method:'POST'}); await refresh(); } catch(e){ console.error(e); }
+}
+function freshnessChipsHtml(f) {
+  function fc(label, src) {
+    if (src && src.na) return chip(label, 'N/A', 'dim');
+    const lvl = (src && src.level) || 'RED';
+    const age = (src && src.age_s != null) ? `${Math.round(src.age_s)}s` : '—';
+    return `<div class="chip lvl-${lvl}"><span class="dot"></span>` +
+      `<span><span class="lbl">${label}</span><br>${age} · ${lvl}</span></div>`;
+  }
+  return [
+    fc('Broker snapshot', f.broker),
+    fc('Monitor heartbeat', f.heartbeat),
+    fc('Last event', f.event),
+    fc('Dashboard', f.dashboard),
+  ].join('') + (f.degraded ? `<div class="chip bad"><span class="dot"></span>
+    <span><span class="lbl">State</span><br>DEGRADED</span></div>` : '');
+}
+function levelBadge(lvl) {
+  return `<span class="pill ${lvl === 'GREEN' ? 'target' : (lvl === 'RED' ? 'stop' : 'voided')}">${lvl}</span>`;
+}
+function reconHealthHtml(rh) {
+  const kv = [
+    ['Closed trades', rh.closed_trades],
+    ['Open trades', rh.open_trades],
+    ['Partial fills pending', rh.partial_pending],
+    ['Unmatched executions', rh.unmatched_executions],
+    ['Duplicate broker events ignored', rh.duplicates_ignored],
+    ['Reconciliation errors', rh.reconciliation_errors + (rh.reconcile_error ? ` — ${rh.reconcile_error}` : '')],
+  ];
+  return kv.map(([k,v]) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+}
+function dailyRiskHtml(dr) {
+  const kv = [
+    ['Realized P&L (today)', `<span class="${rcls(dr.daily_pnl)}">${fmtUSD(dr.daily_pnl)}</span>`],
+    ['Realized R (today)', `<span class="${rcls(dr.daily_R)}">${(dr.daily_R>=0?'+':'')+num(dr.daily_R)}R</span>`],
+    ['Drawdown (today)', fmtUSD(dr.daily_drawdown)],
+    ['Open risk', `${num(dr.open_risk_R,1)}R`],
+    ['Trades today', dr.trades_today],
+  ];
+  let html = kv.map(([k,v]) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('');
+  (dr.alarms || []).forEach(a => {
+    html += `<div class="kv"><span class="k lvl-RED">${a.title}</span><span class="v lvl-RED">${a.detail}</span></div>`;
+  });
+  return html;
+}
+
 function positionsHtml(snapshot) {
   if (!snapshot) return '<div class="dim" style="padding:14px 0">No position snapshots yet. Start <code>python -m live.positions</code>.</div>';
   const meta = `<div style="display:flex;gap:24px;margin-bottom:14px;">
@@ -775,8 +962,14 @@ async function refresh() {
     document.getElementById('count_trades').textContent = m.n_closed;
     document.getElementById('count_positions').textContent =
       positions.snapshot ? positions.snapshot.positions.length : (ops.positions || []).length;
-    document.getElementById('count_ops').textContent = ops.kill_switch.present ? '⛔' : '✓';
+    const nCrit = (ops.latched_critical || []).length;
+    document.getElementById('count_ops').textContent =
+      !ops.supervision.safe ? (nCrit ? '⛔' + nCrit : '✗') : '✓';
     document.getElementById('last_update').textContent = new Date().toLocaleTimeString();
+
+    // ---- always-visible supervision + critical banners (Phase 6/3) ----
+    setHTML('supervision_banner', supervisionBannerHtml(ops));
+    setHTML('critical_banner', criticalBannerHtml(ops));
 
     // ---- Now: safety strip + reconciliation KPIs ----
     setHTML('now_safety', opsAnswersHtml(ops));
@@ -786,8 +979,12 @@ async function refresh() {
 
     // ---- Ops ----
     setHTML('ops_answers', opsAnswersHtml(ops));
+    setHTML('ops_freshness', freshnessChipsHtml(ops.freshness));
     setHTML('ops_account', opsAccountHtml(ops));
     setHTML('ops_run', opsRunHtml(ops));
+    setHTML('ops_recon', reconHealthHtml(ops.reconciliation_health));
+    setHTML('ops_recon_lvl', levelBadge(ops.reconciliation_health.level));
+    setHTML('ops_risk', dailyRiskHtml(ops.daily_risk));
     setHTML('ops_orders', opsOrdersHtml(ops));
     setHTML('ops_gate', opsGateHtml(ops));
     setHTML('ops_flatten', `<div class="metric-note" style="font-style:normal">${ops.flatten_reminder}</div>`);

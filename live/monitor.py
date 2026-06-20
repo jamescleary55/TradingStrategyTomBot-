@@ -73,6 +73,15 @@ def _save_state(symbol: str, tf: str, state: dict) -> None:
 # running (mode / AUTO_PAPER_SAFE / market-data status / liveness). Written at
 # startup, removed on clean shutdown; the reader verifies the PID is alive.
 RUNTIME_FILE = STATE_DIR / "monitor-runtime.json"
+HEARTBEAT_FILE = STATE_DIR / "monitor-heartbeat.txt"
+
+
+def _touch_heartbeat() -> None:
+    """Frequent liveness beacon so the dashboard can detect a stalled monitor."""
+    try:
+        HEARTBEAT_FILE.write_text(dt.datetime.now(dt.timezone.utc).isoformat())
+    except Exception:
+        pass
 
 
 def _write_runtime(*, mode: str, auto_execute: bool, symbols: list,
@@ -514,6 +523,7 @@ def main():
     _write_runtime(mode=mode, auto_execute=args.auto_execute,
                    symbols=[sim for _s, sim in pairs], data_status=data_status_by_sym,
                    kill_switch_path=rules.kill_switch_path)
+    _touch_heartbeat()
 
     if args.once:
         total = 0
@@ -538,11 +548,16 @@ def main():
         threads.append(t)
 
     while not _should_stop.is_set():
+        _touch_heartbeat()
         time.sleep(1)
     log.info("Stopping... draining %d watcher(s).", len(threads))
     for t in threads:
         t.join(timeout=3)
     _clear_runtime()
+    try:
+        HEARTBEAT_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
     log.info("Stopped (Ctrl-C). Bye.")
 
 
