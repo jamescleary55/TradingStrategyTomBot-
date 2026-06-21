@@ -357,6 +357,16 @@ def _handle_signal(signum, frame):
 
 def _watch_loop(spec: WatchSpec, alerter: Alerter, state: dict,
                 risk_gate: Optional[RiskGate] = None) -> None:
+    # ib_insync / ib_async require an asyncio event loop in the *current* thread.
+    # Worker threads have none by default (Py3.9 raises "no current event loop in
+    # thread"), which silently broke IBKR data AND would break IBKR order
+    # placement here. Give this thread its own loop before any IBKR call.
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     tick_no = 0
     while not _should_stop.is_set():
         tick_no += 1
